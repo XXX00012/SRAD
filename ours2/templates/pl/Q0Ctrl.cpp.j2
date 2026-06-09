@@ -1,0 +1,169 @@
+#include "../aie/Config.h"
+
+#include <ap_int.h>
+#include <hls_stream.h>
+#include <cstdint>
+
+namespace {
+
+using plio_word_t = ap_uint<64>;
+constexpr int kQ0DebugBase =
+    srad_cfg::kOutputElems + srad_cfg::kTopPlWorkers;
+
+static_assert(srad_cfg::kTopPlWorkers == {{ toppl_workers }},
+              "ours2 Q0Ctrl expects {{ toppl_workers }} TopPL workers");
+
+ap_uint<32> float_to_bits(float value) {
+    union {
+        float f;
+        uint32_t u;
+    } conv;
+
+    conv.f = value;
+    return ap_uint<32>(conv.u);
+}
+
+float bits_to_float(ap_uint<32> bits) {
+    union {
+        float f;
+        uint32_t u;
+    } conv;
+
+    conv.u = static_cast<uint32_t>(bits);
+    return conv.f;
+}
+
+plio_word_t pack_two_floats(float lane0, float lane1) {
+    plio_word_t word = 0;
+    word.range(31, 0) = float_to_bits(lane0);
+    word.range(63, 32) = float_to_bits(lane1);
+    return word;
+}
+
+float unpack_lane0(plio_word_t word) {
+    return bits_to_float(word.range(31, 0));
+}
+
+float unpack_lane1(plio_word_t word) {
+    return bits_to_float(word.range(63, 32));
+}
+
+float compute_q0sqr_from_sums(float sum, float sum2) {
+#pragma HLS INLINE
+    const float mean = sum / static_cast<float>(srad_cfg::kPixels);
+    const float variance =
+        (sum2 / static_cast<float>(srad_cfg::kPixels)) - (mean * mean);
+    return (mean != 0.0f) ? (variance / (mean * mean)) : 0.0f;
+}
+
+int active_iterations(int iter_cnt) {
+#pragma HLS INLINE
+    int active_iters = iter_cnt;
+    if (active_iters < 1) {
+        active_iters = 1;
+    }
+    if (active_iters > srad_cfg::kSradIterations) {
+        active_iters = srad_cfg::kSradIterations;
+    }
+    return active_iters;
+}
+
+void write_q0_debug(float* debug, int slot, float value) {
+#pragma HLS INLINE
+    debug[kQ0DebugBase + slot] = value;
+}
+
+void read_stats(
+{% for worker in workers %}
+                hls::stream<plio_word_t>& stat_in_{{ worker }}{% if not loop.last %},{% endif %}
+{% endfor %}
+                ,
+                float* debug,
+                int phase,
+                float& sum,
+                float& sum2) {
+#pragma HLS INLINE off
+{% for worker in workers %}
+    const plio_word_t s{{ worker }} = stat_in_{{ worker }}.read();
+    write_q0_debug(debug, {{ worker + 2 }}, {{ 30 + worker * 10 }}.0f + static_cast<float>(phase));
+{% endfor %}
+
+    sum = {% for worker in workers %}unpack_lane0(s{{ worker }}){% if not loop.last %} + {% endif %}{% endfor %};
+    sum2 = {% for worker in workers %}unpack_lane1(s{{ worker }}){% if not loop.last %} + {% endif %}{% endfor %};
+}
+
+void broadcast_q0(float q0sqr,
+{% for worker in workers %}
+                  hls::stream<plio_word_t>& q0_out_{{ worker }}{% if not loop.last %},{% endif %}
+{% endfor %}
+                  ,
+                  float* debug,
+                  int phase) {
+#pragma HLS INLINE off
+    const plio_word_t q0_word = pack_two_floats(q0sqr, 0.0f);
+{% for worker in workers %}
+    q0_out_{{ worker }}.write(q0_word);
+    write_q0_debug(debug, {{ worker + 2 }}, {{ 80 + worker * 10 }}.0f + static_cast<float>(phase));
+{% endfor %}
+}
+
+} // namespace
+
+extern "C" {
+
+void Q0Ctrl(float* debug,
+            int iter_cnt,
+{% for worker in workers %}
+            hls::stream<plio_word_t>& stat_in_{{ worker }},
+{% endfor %}
+{% for worker in workers %}
+            hls::stream<plio_word_t>& q0_out_{{ worker }}{% if not loop.last %},{% endif %}
+{% endfor %}
+            ) {
+#pragma HLS INTERFACE m_axi port=debug offset=slave bundle=gmem0
+#pragma HLS INTERFACE s_axilite port=debug bundle=control
+#pragma HLS INTERFACE s_axilite port=iter_cnt bundle=control
+{% for worker in workers %}
+#pragma HLS INTERFACE axis port=stat_in_{{ worker }}
+{% endfor %}
+{% for worker in workers %}
+#pragma HLS INTERFACE axis port=q0_out_{{ worker }}
+{% endfor %}
+#pragma HLS INTERFACE s_axilite port=return bundle=control
+
+    const int active_iters = active_iterations(iter_cnt);
+    write_q0_debug(debug, 0, 10.0f);
+    write_q0_debug(debug, 1, static_cast<float>(active_iters));
+
+    for (int phase = 0; phase <= srad_cfg::kSradIterations; ++phase) {
+        if (phase <= active_iters) {
+            write_q0_debug(debug, 0, 20.0f + static_cast<float>(phase));
+            write_q0_debug(debug, 1, static_cast<float>(phase));
+            float sum = 0.0f;
+            float sum2 = 0.0f;
+            read_stats(
+{% for worker in workers %}
+                       stat_in_{{ worker }},
+{% endfor %}
+                       debug,
+                       phase,
+                       sum,
+                       sum2);
+
+            if (phase < active_iters) {
+                const float q0sqr = compute_q0sqr_from_sums(sum, sum2);
+                write_q0_debug(debug, 0, 70.0f + static_cast<float>(phase));
+                broadcast_q0(q0sqr,
+{% for worker in workers %}
+                             q0_out_{{ worker }},
+{% endfor %}
+                             debug,
+                             phase);
+            }
+        }
+    }
+
+    write_q0_debug(debug, 0, 200.0f);
+}
+
+}

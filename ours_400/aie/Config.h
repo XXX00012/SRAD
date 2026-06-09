@@ -5,14 +5,16 @@ namespace srad_cfg {
 constexpr int kAieArrayCols = 50;
 constexpr int kAieArrayRows = 8;
 constexpr int kParallelLanes = 200;
+constexpr int kTopPlWorkers = 10;
+constexpr int kWorkerLanes = kParallelLanes / kTopPlWorkers;
+constexpr int kWorkerGroupLanes = 4;
+constexpr int kWorkerGroups = kWorkerLanes / kWorkerGroupLanes;
 constexpr int kInputLanesPerPlio = 1;
 constexpr int kInputPlioGroups =
     (kParallelLanes + kInputLanesPerPlio - 1) / kInputLanesPerPlio;
 constexpr int kOutputLanesPerPlio = 2;
 constexpr int kOutputPlioGroups =
     (kParallelLanes + kOutputLanesPerPlio - 1) / kOutputLanesPerPlio;
-constexpr int kTopPlWorkers = 4;
-constexpr int kWorkerLanes = kParallelLanes / kTopPlWorkers;
 constexpr int kWorkerOutputGroups = kOutputPlioGroups / kTopPlWorkers;
 constexpr int kKernelsPerParallelLane = 2;
 constexpr int kParallelLanesPerCol =
@@ -112,7 +114,8 @@ constexpr int kOutputRows = kOutputLastRow - kOutputFirstRow + 1;
 constexpr int kOutputCols = kOutputLastCol - kOutputFirstCol + 1;
 constexpr int kCompareRows = kOutputRows;
 constexpr int kOutputElems = kOutputRows * kOutputCols;
-constexpr int kAieOutputTilesPerLane = kGraphRunIterations * kSradIterations;
+constexpr int kAieOutputTilesPerLane =
+    kGraphRunIterations * kSradIterations;
 constexpr int kAieOutputElemsPerLane =
     kAieOutputTilesPerLane * kOutputSampleElems;
 constexpr int kAieOutputTiles =
@@ -161,30 +164,38 @@ constexpr int kDefaultIterations = kSradIterations;
 
 static_assert(kRows > 0, "SRAD image must have at least one row");
 static_assert(kCols > 0, "SRAD image must have at least one column");
-static_assert(kAieArrayRows % kKernelsPerParallelLane == 0,
-              "Each lane occupies an integer number of AIE rows");
-static_assert(kParallelLanesPerCol * kAieArrayCols >= kParallelLanes,
-              "AIE array does not have enough tile slots for all lanes");
-static_assert(kTotalAieCores == 400,
-              "ours_400 is expected to instantiate exactly 400 kernels");
+static_assert(kTopPlWorkers == 10,
+              "ours_400 generated config expects 10 PL workers");
+static_assert(kParallelLanes == 200,
+              "ours_400 generated config expects 200 AIE lanes");
+static_assert(kWorkerLanes == 20,
+              "ours_400 generated config expects 20 AIE lanes per PL worker");
+static_assert(kWorkerGroupLanes == 4,
+              "ours_400 generated config expects 4 AIE lanes per worker group");
+static_assert(kWorkerLanes % kWorkerGroupLanes == 0,
+              "Worker lanes must split evenly into worker groups");
+static_assert(kParallelLanes % kTopPlWorkers == 0,
+              "PL workers must evenly cover AIE lanes");
 static_assert(kParallelLanes % kInputLanesPerPlio == 0,
               "Input PLIO grouping expects an even lane count");
-static_assert(kInputPlioGroups == 200,
-              "ours_400 should expose 200 input PLIOs");
+static_assert(kInputPlioGroups == kParallelLanes,
+              "This design keeps one input PLIO per AIE lane");
 static_assert(kParallelLanes % kOutputLanesPerPlio == 0,
               "Output PLIO grouping expects an even lane count");
-static_assert(kOutputPlioGroups == 100,
-              "ours_400 should expose 100 output PLIO groups");
-static_assert(kTopPlWorkers == 4,
-              "ours_400 split PL path expects four TopPL workers");
-static_assert(kParallelLanes % kTopPlWorkers == 0,
-              "TopPL workers must split input lanes evenly");
 static_assert(kOutputPlioGroups % kTopPlWorkers == 0,
-              "TopPL workers must split output PLIO groups evenly");
-static_assert(kWorkerLanes == 50,
-              "ours_400 expects 50 AIE lanes per TopPL worker");
-static_assert(kWorkerOutputGroups == 25,
-              "ours_400 expects 25 output PLIO groups per TopPL worker");
+              "PL workers must evenly cover output PLIO groups");
+static_assert(kWorkerOutputGroups == 10,
+              "Each worker must own one pktmerge output group per two lanes");
+static_assert(kParallelLanesPerCol > 0,
+              "AIE row count must fit at least one lane per column");
+static_assert(kParallelLanesPerCol * kAieArrayCols >= kParallelLanes,
+              "AIE placement grid must cover all lanes");
+static_assert(kAieArrayRows % kKernelsPerParallelLane == 0,
+              "AIE rows must pack whole two-kernel lanes");
+static_assert(kTotalAieCores <= kAieArrayRows * kAieArrayCols,
+              "AIE placement grid must cover all lane kernels");
+static_assert(kTotalTileCount > 0,
+              "SRAD tile grid must contain at least one tile");
 static_assert(kInputLogicalRows == kImageInputWindowRows,
               "One graph firing consumes one full logical input tile");
 static_assert(kTileValidRows > 0, "SRAD tile has no valid output rows");
@@ -222,10 +233,10 @@ static_assert(kOutputStatElems == 2,
 static_assert(kOutputElems == kPixels,
               "Ping-pong iterations require compact output to cover the full image");
 static_assert(kRows % kTileStrideRows == 0,
-              "Tile stats q0 path expects no partial output tile rows");
+              "Full-chip performance path expects no partial output tile rows");
 static_assert(kCols % kTileStrideCols == 0,
-              "Tile stats q0 path expects no partial output tile cols");
+              "Full-chip performance path expects no partial output tile cols");
 static_assert(kOutputTileCols % kLanes == 0,
               "AIE output rows are expected to be lane-aligned");
 
-}
+} // namespace srad_cfg

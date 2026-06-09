@@ -150,11 +150,11 @@ constexpr int kGradBytes = kGradElems * kScalarBytes;
 constexpr int kGradBytesPerTile = kGradElemsPerTile * kScalarBytes;
 constexpr int kGradBytesPerRow = kGradBytesPerTile;
 
-constexpr int kInputObjectFifoDepth = 2;
-constexpr int kDelayedInputObjectFifoDepth = 2;
-constexpr int kMidObjectFifoDepth = 2;
+constexpr int kInputObjectFifoDepth = 4;
+constexpr int kDelayedInputObjectFifoDepth = 4;
+constexpr int kMidObjectFifoDepth = 4;
 constexpr int kGradObjectFifoDepth = 2;
-constexpr int kOutputObjectFifoDepth = 2;
+constexpr int kOutputObjectFifoDepth = 4;
 
 constexpr int kDefaultIterations = kSradIterations;
 

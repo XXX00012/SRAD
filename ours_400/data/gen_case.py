@@ -2,6 +2,7 @@
 
 import math
 import re
+import argparse
 from pathlib import Path
 
 
@@ -60,14 +61,12 @@ def read_config_dims():
         "kQ0SqrTileCol",
         "kTileRowCount",
         "kTileColCount",
-        "kTotalTileCount",
         "kTileStrideRows",
         "kTileStrideCols",
     )
     missing = [name for name in required if name not in values]
     if missing:
         raise RuntimeError(f"cannot read {', '.join(missing)} from Config.h")
-
     lam_match = re.search(
         r"constexpr\s+float\s+kLambdaDefault\s*=\s*([0-9eE+\-.]+)f?\s*;",
         text,
@@ -78,7 +77,6 @@ def read_config_dims():
         text,
     )
     bypass = bypass_match is not None and bypass_match.group(1) == "true"
-
     return (
         values["kRows"],
         values["kCols"],
@@ -97,7 +95,6 @@ def read_config_dims():
         values["kQ0SqrTileCol"],
         values["kTileRowCount"],
         values["kTileColCount"],
-        values["kTotalTileCount"],
         values["kTileStrideRows"],
         values["kTileStrideCols"],
         lambda_default,
@@ -123,7 +120,6 @@ def read_config_dims():
     Q0SQR_TILE_COL,
     TILE_ROW_COUNT,
     TILE_COL_COUNT,
-    TOTAL_TILE_COUNT,
     TILE_STRIDE_ROWS,
     TILE_STRIDE_COLS,
     LAMBDA_DEFAULT,
@@ -224,12 +220,41 @@ def tile_start(tile_idx: int, stride: int) -> int:
     return tile_idx * stride
 
 
-def append_j_tile(out, image, q0sqr, tile_linear):
-    valid_tile = tile_linear < TOTAL_TILE_COUNT
-    tile_r = tile_linear // TILE_COL_COUNT if valid_tile else 0
-    tile_c = tile_linear % TILE_COL_COUNT if valid_tile else 0
-    row_start = tile_start(tile_r, TILE_STRIDE_ROWS)
-    col_start = tile_start(tile_c, TILE_STRIDE_COLS)
+def make_j_tile_stream(image, q0sqr):
+    out = []
+    for tile_r in range(TILE_ROW_COUNT):
+        row_start = tile_start(tile_r, TILE_STRIDE_ROWS)
+        for tile_c in range(TILE_COL_COUNT):
+            col_start = tile_start(tile_c, TILE_STRIDE_COLS)
+            for lr in range(INPUT_LOGICAL_ROWS):
+                gr = row_start + lr - HALO_TOP_ROWS
+                for lc in range(INPUT_ROW_ELEMS):
+                    if lr == Q0SQR_TILE_ROW and lc == Q0SQR_TILE_COL:
+                        out.append(q0sqr)
+                        continue
+                    if lc >= INPUT_LOGICAL_COLS:
+                        out.append(0.0)
+                        continue
+                    gc = col_start + lc - HALO_LEFT_COLS
+                    if 0 <= gr < ROWS and 0 <= gc < COLS:
+                        out.append(image[idx(gr, gc)])
+                    else:
+                        out.append(0.0)
+    return out
+
+
+def make_one_tile_stream(image, q0sqr, tile_linear):
+    out = []
+    if tile_linear >= TILE_ROW_COUNT * TILE_COL_COUNT:
+        row_start = 0
+        col_start = 0
+        valid_tile = False
+    else:
+        tile_r = tile_linear // TILE_COL_COUNT
+        tile_c = tile_linear % TILE_COL_COUNT
+        row_start = tile_start(tile_r, TILE_STRIDE_ROWS)
+        col_start = tile_start(tile_c, TILE_STRIDE_COLS)
+        valid_tile = True
 
     for lr in range(INPUT_LOGICAL_ROWS):
         gr = row_start + lr - HALO_TOP_ROWS
@@ -237,14 +262,15 @@ def append_j_tile(out, image, q0sqr, tile_linear):
             if lr == Q0SQR_TILE_ROW and lc == Q0SQR_TILE_COL:
                 out.append(q0sqr)
                 continue
-            if lc >= INPUT_LOGICAL_COLS:
+            if not valid_tile or lc >= INPUT_LOGICAL_COLS:
                 out.append(0.0)
                 continue
             gc = col_start + lc - HALO_LEFT_COLS
-            if valid_tile and 0 <= gr < ROWS and 0 <= gc < COLS:
+            if 0 <= gr < ROWS and 0 <= gc < COLS:
                 out.append(image[idx(gr, gc)])
             else:
                 out.append(0.0)
+    return out
 
 
 STALE_FILES = (
@@ -258,12 +284,12 @@ STALE_FILES = (
     "input_32x32.txt",
     "lambda.txt",
     "plio_ours_j_next.txt",
+    "plio_ours_j_tile.txt",
+    "plio_ours_j_tile.txt.tmp",
     "plio_ours_j_k1.txt",
     "plio_ours_j_k1.txt.tmp",
     "plio_ours_j_k2.txt",
     "plio_ours_j_k2.txt.tmp",
-    "plio_ours_j_tile.txt",
-    "plio_ours_j_tile.txt.tmp",
     "plio_ours_j_update.txt",
     "plio_ours_lambda.txt",
     "plio_ours_j.txt.tmp",
@@ -273,25 +299,31 @@ STALE_FILES = (
     "q0sqr_ref.txt",
 )
 
-STALE_GLOBS = (
-    "plio_ours_j_tile_*.txt",
-    "plio_ours_j_tile_*.txt.tmp",
-    "plio_ours_j_next_*.txt",
-    "plio_ours_j_next_*.txt.tmp",
-)
-
 
 def cleanup_stale_files(base: Path):
     for name in STALE_FILES:
         path = base / name
         if path.exists():
             path.unlink()
-    for pattern in STALE_GLOBS:
-        for path in base.glob(pattern):
+    for path in base.glob("plio_ours_j_tile_*.txt*"):
+        if path.is_file():
             path.unlink()
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Generate SRAD input data.")
+    parser.add_argument(
+        "--board-only",
+        action="store_true",
+        help="generate only the DDR input image required by the board run",
+    )
+    parser.add_argument(
+        "--aie-sim",
+        action="store_true",
+        help="also generate per-lane AIE simulation PLIO streams",
+    )
+    args = parser.parse_args()
+
     base = Path(__file__).resolve().parent
     cleanup_stale_files(base)
 
@@ -306,26 +338,30 @@ def main():
             )
             image.append(v)
 
-    j_ddr_stream = make_j_stream(image)
-    lane_streams = [[] for _ in range(PARALLEL_LANES)]
+    write_plio64_stream(base / "plio_ours_j.txt", make_j_stream(image))
+
     q0_values = []
-    cur = image
-    for _ in range(SRAD_ITERATIONS):
-        q0sqr = compute_q0sqr(cur)
-        q0_values.append(q0sqr)
-        for lane in range(PARALLEL_LANES):
-            for tile_iter in range(GRAPH_RUN_ITERATIONS):
-                tile_linear = tile_iter * PARALLEL_LANES + lane
-                append_j_tile(lane_streams[lane], cur, q0sqr, tile_linear)
-        cur = srad_next(cur, q0sqr)
-
-    write_plio64_stream(base / "plio_ours_j.txt", j_ddr_stream)
-    total_tile_stream_lines = 0
-    for lane, stream in enumerate(lane_streams):
-        total_tile_stream_lines += len(stream) // 2
-        write_plio64_stream(base / f"plio_ours_j_tile_{lane}.txt", stream)
-
-    print(f"generated {ROWS}x{COLS} Ours_400 float SRAD case")
+    if args.aie_sim:
+        j_tile_stream = []
+        lane_tile_streams = [[] for _ in range(PARALLEL_LANES)]
+        cur = image
+        for _ in range(SRAD_ITERATIONS):
+            q0sqr = compute_q0sqr(cur)
+            q0_values.append(q0sqr)
+            j_tile_stream.extend(make_j_tile_stream(cur, q0sqr))
+            for graph_iter in range(GRAPH_RUN_ITERATIONS):
+                for lane in range(PARALLEL_LANES):
+                    tile_linear = graph_iter * PARALLEL_LANES + lane
+                    lane_tile_streams[lane].extend(
+                        make_one_tile_stream(cur, q0sqr, tile_linear)
+                    )
+            cur = srad_next(cur, q0sqr)
+        write_plio64_stream(base / "plio_ours_j_tile.txt", j_tile_stream)
+        for lane, stream in enumerate(lane_tile_streams):
+            write_plio64_stream(base / f"plio_ours_j_tile_{lane}.txt", stream)
+    else:
+        q0_values.append(compute_q0sqr(image))
+    print(f"generated {ROWS}x{COLS} Ours float SRAD case")
     print(
         f"iterations={SRAD_ITERATIONS}, lambda={LAMBDA_DEFAULT:.9g}, "
         f"bypass_coeff_math={BYPASS_COEFF_MATH}"
@@ -337,18 +373,20 @@ def main():
         f"physical row {INPUT_ROW_ELEMS}"
     )
     print(
-        f"parallel lanes={PARALLEL_LANES}, "
         f"graph firings/lane={GRAPH_RUN_ITERATIONS * SRAD_ITERATIONS}, "
+        f"lanes={PARALLEL_LANES}, "
         f"input floats/firing/lane={INPUT_LOGICAL_ROWS * INPUT_ROW_ELEMS}, "
         f"output floats/firing/lane={OUTPUT_SAMPLE_ELEMS}"
     )
-    print(
-        f"PLIO lines: J_tile_total={total_tile_stream_lines}, "
-        f"J_tile_per_lane="
-        f"{GRAPH_RUN_ITERATIONS * SRAD_ITERATIONS * INPUT_LOGICAL_ROWS * INPUT_ROW_ELEMS // 2}; "
-        f"q0 embedded at row {Q0SQR_TILE_ROW}, col {Q0SQR_TILE_COL}"
-    )
-    print(f"q0sqr first={q0_values[0]:.9g}, last={q0_values[-1]:.9g}")
+    if args.aie_sim:
+        print(
+            f"PLIO lines: J_tile={len(j_tile_stream) // 2}; "
+            f"q0 embedded at row {Q0SQR_TILE_ROW}, col {Q0SQR_TILE_COL}"
+        )
+        print(f"q0sqr first={q0_values[0]:.9g}, last={q0_values[-1]:.9g}")
+    else:
+        print("board data only: generated ./data/plio_ours_j.txt")
+        print(f"q0sqr input={q0_values[0]:.9g}")
 
 
 if __name__ == "__main__":

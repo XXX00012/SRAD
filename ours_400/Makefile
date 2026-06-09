@@ -13,15 +13,16 @@ TARGET ?= hw
 XO_DIR=./$(TARGET).xo_dir
 XSA_DIR=./$(TARGET).xsa_dir
 PACKAGE_DIR = ./$(TARGET).xclbin_dir
+SD_CARD_DIR = ./sd_card
 
 # File names and locations
-WORKER_KERNEL := TopPLWorker
+PL_KERNEL := TopPL
 Q0_KERNEL := Q0Ctrl
-WORKER_KERNEL_SRC := ./pl/$(WORKER_KERNEL).cpp
+PL_KERNEL_SRC := ./pl/$(PL_KERNEL).cpp
 Q0_KERNEL_SRC := ./pl/$(Q0_KERNEL).cpp
-WORKER_KERNEL_XO := ./pl/$(WORKER_KERNEL).xo
+PL_KERNEL_XO := ./pl/$(PL_KERNEL).xo
 Q0_KERNEL_XO := ./pl/$(Q0_KERNEL).xo
-KERNEL_XOS := $(WORKER_KERNEL_XO) $(Q0_KERNEL_XO)
+KERNEL_XOS := $(PL_KERNEL_XO) $(Q0_KERNEL_XO)
 
 XSA := ./$(XSA_DIR)/svd.xsa
 HOST_SRC = ./ps/host.cpp
@@ -30,12 +31,13 @@ RUN_SH = ./run.sh
 XRT_INI = ./xrt.ini
 XCLBIN = ./$(PACKAGE_DIR)/svd.xclbin
 GRAPH := ./aie/TopGraph.cpp
-DATA_FILES := $(wildcard ./data/*.txt)
+DATA_FILES := ./data/plio_ours_j.txt
 DATA_GEN := ./data/gen_case.py
-PLIO_LANE_IDS := $(shell seq 0 199)
+PLIO_LANE_IDS := 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 129 130 131 132 133 134 135 136 137 138 139 140 141 142 143 144 145 146 147 148 149 150 151 152 153 154 155 156 157 158 159 160 161 162 163 164 165 166 167 168 169 170 171 172 173 174 175 176 177 178 179 180 181 182 183 184 185 186 187 188 189 190 191 192 193 194 195 196 197 198 199
 PLIO_DATA_FILES := \
 	./data/plio_ours_j.txt \
-	$(addprefix ./data/plio_ours_j_tile_,$(addsuffix .txt,$(PLIO_LANE_IDS)))
+	./data/plio_ours_j_tile.txt \
+	$(foreach lane,$(PLIO_LANE_IDS),./data/plio_ours_j_tile_$(lane).txt)
 PROJECT_HEADERS := \
 	./aie/TopGraph.h \
 	./aie/Config.h \
@@ -47,9 +49,7 @@ AIE_DEPS := Makefile \
 	$(PROJECT_HEADERS) \
 	./aie/ProcessGraph/StencilCoreGraph.cpp \
 	./aie/ProcessUnit/srad_local_q.cc \
-	./aie/ProcessUnit/srad_coeff_update.cc \
-	$(WORKER_KERNEL_SRC) \
-	$(Q0_KERNEL_SRC)
+	./aie/ProcessUnit/srad_coeff_update.cc
 HOST_DEPS := Makefile \
 	$(HOST_SRC) \
 	$(PROJECT_HEADERS)
@@ -89,19 +89,12 @@ VPP_LINK_FLAGS += --vivado.impl.jobs 256
 
 VPP_FLAGS := $(VPP_LINK_FLAGS)
 
-ifeq ($(TARGET),hw)
-PACKAGE_DATA_DEPS :=
-PACKAGE_DATA_FLAGS :=
-else
-PACKAGE_DATA_DEPS := data $(DATA_FILES)
-PACKAGE_DATA_FLAGS := --package.sd_dir ./data
-endif
-
 CXX := $(XILINX_VITIS)/gnu/aarch64/lin/aarch64-linux/bin/aarch64-linux-gnu-g++
 
 GCC_FLAGS := -Wall -c \
 			 -std=c++20 \
 			 -Wno-int-to-pointer-cast \
+			 -pthread \
 			 --sysroot=$(SYSROOT)
 
 GCC_INCLUDES := -I$(SYSROOT)/usr/include/xrt \
@@ -112,6 +105,7 @@ GCC_INCLUDES := -I$(SYSROOT)/usr/include/xrt \
 				-I./aie
 
 GCC_LIB := -lxaiengine -ladf_api_xrt -lxrt_core -lxrt_coreutil \
+		   -pthread \
 		   -L$(SYSROOT)/usr/lib \
 		   --sysroot=$(SYSROOT) \
 		   -L${XILINX_VITIS}/aietools/lib/aarch64.o
@@ -119,17 +113,27 @@ GCC_LIB := -lxaiengine -ladf_api_xrt -lxrt_core -lxrt_coreutil \
 LDCLFLAGS := $(GCC_LIB)
 
 .ONESHELL:
-.PHONY: clean all kernels aie sim xsa host package run run_emu data \
+.PHONY: clean all kernels aie sim xsa host package sd_card run run_emu data \
+	force_host \
 	clear_aie clear_pl clear_ps clear_xsa clear_package clear_all
 
-all: aie kernels xsa host package
-sd_card: all
+all: aie kernels xsa host package sd_card
+sd_card: $(XCLBIN) $(HOST) $(RUN_SH) $(XRT_INI) $(DATA_FILES)
+	rm -rf $(SD_CARD_DIR)
+	mkdir -p $(SD_CARD_DIR)/data
+	cp $(HOST) $(SD_CARD_DIR)/
+	cp $(XCLBIN) $(SD_CARD_DIR)/svd.xclbin
+	cp $(RUN_SH) $(SD_CARD_DIR)/
+	cp $(XRT_INI) $(SD_CARD_DIR)/
+	cp ./data/*.txt $(SD_CARD_DIR)/data/
+	chmod +x $(SD_CARD_DIR)/run.sh
+	@echo "COMPLETE: board staging files refreshed in $(SD_CARD_DIR)."
 clean: clear_all
 data:
-	python $(DATA_GEN)
+	python $(DATA_GEN) --board-only
 
 $(PLIO_DATA_FILES): $(DATA_GEN) ./aie/Config.h
-	python $(DATA_GEN)
+	python $(DATA_GEN) --aie-sim
 
 ######################################################
 # This step compiles the HLS C kernels and creates the *.xo's
@@ -139,9 +143,9 @@ aie: $(GRAPH_O)
 
 kernels: $(KERNEL_XOS)
 
-$(WORKER_KERNEL_XO): $(WORKER_KERNEL_SRC) ./aie/Config.h ./aie/ProcessUnit/include.h
+$(PL_KERNEL_XO): $(PL_KERNEL_SRC) ./aie/Config.h ./aie/ProcessUnit/include.h
 	mkdir -p $(XO_DIR)
-	$(VPP) $(VPP_XO_FLAGS) -k $(WORKER_KERNEL) -o $(WORKER_KERNEL_XO) $(WORKER_KERNEL_SRC) | tee $(XO_DIR)/$(WORKER_KERNEL).log
+	$(VPP) $(VPP_XO_FLAGS) -k $(PL_KERNEL) -o $(PL_KERNEL_XO) $(PL_KERNEL_SRC) | tee $(XO_DIR)/$(PL_KERNEL).log
 
 $(Q0_KERNEL_XO): $(Q0_KERNEL_SRC) ./aie/Config.h
 	mkdir -p $(XO_DIR)
@@ -179,7 +183,7 @@ $(XSA): $(GRAPH_O) $(KERNEL_XOS) $(CONFIG_FILE) Makefile
 
 host: $(HOST)
 
-$(HOST): $(HOST_DEPS) $(GRAPH_O)
+$(HOST): force_host $(HOST_DEPS) $(GRAPH_O)
 	$(CXX) $(GCC_FLAGS) $(GCC_INCLUDES) -c $(HOST_SRC) -o host.o
 	$(CXX) $(GCC_FLAGS) $(GCC_INCLUDES) -c ./Work/ps/c_rts/aie_control_xrt.cpp -o aie_control_xrt.o
 	$(CXX) host.o aie_control_xrt.o $(GRAPH_O) $(GCC_LIB) -std=c++20 -o $(HOST)
@@ -191,7 +195,7 @@ $(HOST): $(HOST_DEPS) $(GRAPH_O)
 # Depending on the TARGET, it'll either generate the PDI for sw_emu, hw_emu or hw.
 
 package: $(XCLBIN)
-$(XCLBIN): $(PACKAGE_DATA_DEPS) $(XSA) $(GRAPH_O) $(HOST) $(RUN_SH) $(XRT_INI) Makefile
+$(XCLBIN): data $(XSA) $(GRAPH_O) $(HOST) $(RUN_SH) $(XRT_INI) $(DATA_FILES) Makefile
 	mkdir -p $(PACKAGE_DIR)
 	$(VPP) -p -t ${TARGET} \
 		-f ${BASE_PLATFORM} \
@@ -204,7 +208,7 @@ $(XCLBIN): $(PACKAGE_DATA_DEPS) $(XSA) $(GRAPH_O) $(HOST) $(RUN_SH) $(XRT_INI) M
 		--package.sd_file $(HOST) \
 		--package.sd_file $(RUN_SH) \
 		--package.sd_file $(XRT_INI) \
-		$(PACKAGE_DATA_FLAGS) \
+		--package.sd_dir ./data \
 		$(XSA) $(GRAPH_O) -o $(XCLBIN)
 	@echo "COMPLETE: emulation package created."
 
@@ -234,7 +238,7 @@ clear_ps:
 clear_xsa:
 	rm -rf $(XSA_DIR)
 clear_package:
-	rm -rf $(PACKAGE_DIR)
+	rm -rf $(PACKAGE_DIR) $(SD_CARD_DIR)
 clear_all: clear_aie clear_pl clear_ps clear_xsa clear_package
-	rm -rf hls TopPL TopPLWorker Q0Ctrl logs
+	rm -rf hls TopPL logs
 	rm -rf _x v++* .Xil *.db *.log *.wcfg *.wdb pl_sample_counts *.csv .AIE_* ISS_* aiesimulator_* function_*

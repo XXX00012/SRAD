@@ -1,5 +1,5 @@
 // Spill SRAD mapping:
-//   4 PL TopPLWorker CUs stream four 16x16 tiles to 4 AIE lanes.
+//   4 PL TopPL CUs stream four 16x16 tiles to 4 AIE lanes.
 //   PL Q0Ctrl computes global q0sqr from per-worker partial stats.
 //   AIE K1 srad_local_q sends center/south/east coeff value-tag planes.
 //   AIE K2 srad_coeff_update recomputes dN/dS/dW/dE from its J input and
@@ -18,6 +18,7 @@
 #include <experimental/xrt_kernel.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -25,7 +26,9 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 GraphOursPLQ0 graphOursPLQ0("ours_plq0");
@@ -34,13 +37,23 @@ namespace {
 
 constexpr int PREVIEW = 16;
 constexpr int PL_WORKERS = srad_cfg::kTopPlWorkers;
+constexpr int DIAG_POLL_MS = 1000;
+constexpr int TOPPL_DEBUG_BASE = srad_cfg::kOutputElems;
+constexpr int Q0_DEBUG_SLOTS = 8;
+constexpr int Q0_DEBUG_BASE = TOPPL_DEBUG_BASE + PL_WORKERS;
+constexpr int DEBUG_FLOATS = PL_WORKERS + Q0_DEBUG_SLOTS;
+constexpr int OUTPUT_BO_FLOATS = srad_cfg::kOutputElems + DEBUG_FLOATS;
+constexpr int DEBUG_BYTES = DEBUG_FLOATS * srad_cfg::kScalarBytes;
+constexpr int OUTPUT_BO_BYTES = OUTPUT_BO_FLOATS * srad_cfg::kScalarBytes;
 constexpr float kCompareTol = 1.0e-5f;
 using Clock = std::chrono::high_resolution_clock;
 
 struct PipelineTiming {
     long long bo_to_device_us = 0;
     long long submit_us = 0;
+    long long wait_all_us = 0;
     long long toppl_wait_us = 0;
+    long long q0_wait_us = 0;
     long long graph_wait_us = 0;
     long long bo_from_device_us = 0;
 };
@@ -279,6 +292,29 @@ bool is_compare_pixel(int idx) {
     return true;
 }
 
+int toppl_debug_index(int worker_id) {
+    return TOPPL_DEBUG_BASE + worker_id;
+}
+
+void print_debug_status(const float* output_map) {
+    std::printf(" dbg_toppl=[");
+    for (int i = 0; i < PL_WORKERS; ++i) {
+        const int idx = toppl_debug_index(i);
+        std::printf("%s%d:%.0f@%d",
+                    (i == 0) ? "" : " ",
+                    i,
+                    output_map[idx],
+                    idx);
+    }
+    std::printf("] q0dbg=[");
+    for (int i = 0; i < Q0_DEBUG_SLOTS; ++i) {
+        std::printf("%s%.0f",
+                    (i == 0) ? "" : " ",
+                    output_map[Q0_DEBUG_BASE + i]);
+    }
+    std::printf("]");
+}
+
 void compare_output(const std::vector<float>& got,
                     const std::vector<float>& gold) {
     float max_abs = 0.0f;
@@ -316,37 +352,24 @@ void compare_output(const std::vector<float>& got,
     std::printf("mismatch_count_tol_%g: %d\n", kCompareTol, mismatch_count);
 }
 
-xrt::kernel open_toppl_worker_kernel(const xrt::device& device,
-                                      const xrt::uuid& uuid,
-                                      int cu_index) {
+xrt::kernel open_toppl_kernel(const xrt::device& device,
+                              const xrt::uuid& uuid,
+                              int cu_index) {
     char scoped[80];
     std::snprintf(scoped,
                   sizeof(scoped),
-                  "TopPLWorker:{TopPL_%d}",
+                  "TopPL:{TopPL_%d}",
                   cu_index);
-    try {
-        return xrt::kernel(device, uuid, scoped);
-    } catch (const std::exception&) {
-        char cu_only[32];
-        std::snprintf(cu_only, sizeof(cu_only), "TopPL_%d", cu_index);
-        try {
-            return xrt::kernel(device, uuid, cu_only);
-        } catch (const std::exception&) {
-            if (cu_index == 0) {
-                return xrt::kernel(device, uuid, "TopPLWorker");
-            }
-            throw;
-        }
-    }
+    std::printf("[open] %s\n", scoped);
+    std::fflush(stdout);
+    return xrt::kernel(device, uuid, scoped);
 }
 
 xrt::kernel open_q0ctrl_kernel(const xrt::device& device,
                                const xrt::uuid& uuid) {
-    try {
-        return xrt::kernel(device, uuid, "Q0Ctrl:{Q0Ctrl_1}");
-    } catch (const std::exception&) {
-        return xrt::kernel(device, uuid, "Q0Ctrl");
-    }
+    std::printf("[open] Q0Ctrl:{Q0Ctrl_1}\n");
+    std::fflush(stdout);
+    return xrt::kernel(device, uuid, "Q0Ctrl:{Q0Ctrl_1}");
 }
 
 } // namespace
@@ -383,7 +406,7 @@ int main(int argc, char* argv[]) {
     }
     const ReferenceData ref = cpu_reference_iterations(image, lambda, iter_cnt);
 
-    std::printf("mapping               : 4x TopPLWorker + Q0Ctrl + 4-lane AIE K1/K2\n");
+    std::printf("mapping               : 4x TopPL + Q0Ctrl + 4-lane AIE K1/K2\n");
     std::printf("trace kernels         : srad_local_q, srad_coeff_update\n");
     std::printf("iterations            : %d\n", iter_cnt);
     std::printf("image size            : %dx%d (%d pixels)\n",
@@ -411,24 +434,24 @@ int main(int argc, char* argv[]) {
                 srad_cfg::kImageBytes,
                 srad_cfg::kOutputBytes,
                 srad_cfg::kMidBytes);
+    std::printf("output BO bytes       : result=%d debug_tail=%d total=%d\n",
+                srad_cfg::kOutputBytes,
+                DEBUG_BYTES,
+                OUTPUT_BO_BYTES);
     std::printf("float lanes per packet: %d\n", srad_cfg::kLanes);
     std::printf("lambda float32        : %.9g\n", lambda);
     std::printf("q0sqr_ref last iter   : %.9g\n", ref.q0sqr);
     print_preview("input preview:", image);
 
+    xrtDeviceHandle dhdl = nullptr;
+
     try {
         auto device = xrt::device(0);
         auto xrt_uuid = device.load_xclbin(xclbin_path);
 
-        auto dhdl = xrtDeviceOpen(0);
+        dhdl = xrtDeviceOpenFromXcl(device);
         if (!dhdl) {
-            std::fprintf(stderr, "[error] xrtDeviceOpen failed\n");
-            return EXIT_FAILURE;
-        }
-
-        if (xrtDeviceLoadXclbinFile(dhdl, xclbin_path.c_str())) {
-            std::fprintf(stderr, "[error] xrtDeviceLoadXclbinFile failed\n");
-            xrtDeviceClose(dhdl);
+            std::fprintf(stderr, "[error] xrtDeviceOpenFromXcl failed\n");
             return EXIT_FAILURE;
         }
 
@@ -440,19 +463,19 @@ int main(int argc, char* argv[]) {
         toppl_kernels.reserve(PL_WORKERS);
         for (int i = 0; i < PL_WORKERS; ++i) {
             toppl_kernels.emplace_back(
-                open_toppl_worker_kernel(device, xrt_uuid, i));
+                open_toppl_kernel(device, xrt_uuid, i));
         }
         auto q0_kernel = open_q0ctrl_kernel(device, xrt_uuid);
 
         auto input_bo =
             xrt::bo(device, srad_cfg::kImageBytes, toppl_kernels[0].group_id(0));
         auto output_bo =
-            xrt::bo(device, srad_cfg::kOutputBytes, toppl_kernels[0].group_id(1));
+            xrt::bo(device, OUTPUT_BO_BYTES, toppl_kernels[0].group_id(1));
         auto input_map = input_bo.map<float*>();
         auto output_map = output_bo.map<float*>();
 
         std::memcpy(input_map, image.data(), srad_cfg::kImageBytes);
-        std::memset(output_map, 0, srad_cfg::kOutputBytes);
+        std::memset(output_map, 0, OUTPUT_BO_BYTES);
 
         PipelineTiming timing;
         const auto t0 = Clock::now();
@@ -462,7 +485,7 @@ int main(int argc, char* argv[]) {
         output_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         timing.bo_to_device_us = elapsed_us(stage_t0, Clock::now());
 
-        std::printf("---- 4x TopPLWorker + Q0Ctrl + GraphOursPLQ0 ----\n");
+        std::printf("---- 4x TopPL + Q0Ctrl + GraphOursPLQ0 ----\n");
         std::printf("PL input              : DDR J float[%d]\n",
                     srad_cfg::kPixels);
         std::printf("PL q0/output packing  : Q0Ctrl reduces 4 partial stats; q0sqr embedded in first padding column of each 19x24 J tile\n");
@@ -486,71 +509,241 @@ int main(int argc, char* argv[]) {
         std::printf("AIE K2                : srad_coeff_update decodes coeff value-tags, recomputes gradients from J, and applies one 16x16 tile update\n");
         std::fflush(stdout);
 
+        std::printf("[stage] graphOursPLQ0.init begin\n");
+        std::fflush(stdout);
         graphOursPLQ0.init();
+        std::printf("[stage] graphOursPLQ0.init done\n");
+        std::fflush(stdout);
 
         stage_t0 = Clock::now();
-        auto q0_run = q0_kernel(iter_cnt);
-        graphOursPLQ0.run(srad_cfg::kGraphRunIterations * iter_cnt);
+        std::printf("[stage] Q0Ctrl_1 submit begin\n");
+        std::fflush(stdout);
+        auto q0_run = q0_kernel(output_bo, iter_cnt);
+        std::printf("[stage] Q0Ctrl_1 submit done\n");
+        std::fflush(stdout);
+
         std::vector<xrt::run> toppl_runs;
         toppl_runs.reserve(PL_WORKERS);
         for (int i = 0; i < PL_WORKERS; ++i) {
+            std::printf("[stage] TopPL_%d submit begin\n", i);
+            std::fflush(stdout);
             toppl_runs.emplace_back(toppl_kernels[i](input_bo,
                                                      output_bo,
                                                      iter_cnt,
                                                      i));
+            std::printf("[stage] TopPL_%d submit done\n", i);
+            std::fflush(stdout);
         }
+
+        std::printf("[stage] graphOursPLQ0.run begin\n");
+        std::fflush(stdout);
+        graphOursPLQ0.run(srad_cfg::kGraphRunIterations * iter_cnt);
+        std::printf("[stage] graphOursPLQ0.run done\n");
+        std::fflush(stdout);
         timing.submit_us = elapsed_us(stage_t0, Clock::now());
 
         stage_t0 = Clock::now();
+        std::printf("[stage] wait begin\n");
+        std::fflush(stdout);
+
+        std::atomic_bool toppl_done[PL_WORKERS];
+        std::atomic_bool toppl_failed[PL_WORKERS];
+        long long toppl_wait_elapsed[PL_WORKERS] = {};
         for (int i = 0; i < PL_WORKERS; ++i) {
-            toppl_runs[i].wait();
+            toppl_done[i].store(false, std::memory_order_relaxed);
+            toppl_failed[i].store(false, std::memory_order_relaxed);
         }
-        q0_run.wait();
-        timing.toppl_wait_us = elapsed_us(stage_t0, Clock::now());
+        std::atomic_bool q0_done(false);
+        std::atomic_bool q0_failed(false);
+        std::atomic_bool graph_done(false);
+        std::atomic_bool graph_failed(false);
+        long long q0_wait_elapsed = 0;
+        long long graph_wait_elapsed = 0;
 
-        stage_t0 = Clock::now();
-        graphOursPLQ0.wait();
-        timing.graph_wait_us = elapsed_us(stage_t0, Clock::now());
+        std::vector<std::thread> toppl_wait_threads;
+        toppl_wait_threads.reserve(PL_WORKERS);
+        for (int i = 0; i < PL_WORKERS; ++i) {
+            toppl_wait_threads.emplace_back([&, i]() {
+                const auto wait_t0 = Clock::now();
+                std::printf("[stage] TopPL_%d wait begin\n", i);
+                std::fflush(stdout);
+                try {
+                    toppl_runs[i].wait();
+                    toppl_wait_elapsed[i] = elapsed_us(wait_t0, Clock::now());
+                    toppl_done[i].store(true, std::memory_order_relaxed);
+                    std::printf("[stage] TopPL_%d wait done (%lld us)\n",
+                                i,
+                                toppl_wait_elapsed[i]);
+                    std::fflush(stdout);
+                } catch (const std::exception& ex) {
+                    toppl_wait_elapsed[i] = elapsed_us(wait_t0, Clock::now());
+                    toppl_failed[i].store(true, std::memory_order_relaxed);
+                    toppl_done[i].store(true, std::memory_order_relaxed);
+                    std::fprintf(stderr,
+                                 "[error] TopPL_%d wait failed: %s\n",
+                                 i,
+                                 ex.what());
+                    std::fflush(stderr);
+                }
+            });
+        }
 
+        std::thread q0_wait_thread([&]() {
+            const auto wait_t0 = Clock::now();
+            std::printf("[stage] Q0Ctrl_1 wait begin\n");
+            std::fflush(stdout);
+            try {
+                q0_run.wait();
+                q0_wait_elapsed = elapsed_us(wait_t0, Clock::now());
+                q0_done.store(true, std::memory_order_relaxed);
+                std::printf("[stage] Q0Ctrl_1 wait done (%lld us)\n",
+                            q0_wait_elapsed);
+                std::fflush(stdout);
+            } catch (const std::exception& ex) {
+                q0_wait_elapsed = elapsed_us(wait_t0, Clock::now());
+                q0_failed.store(true, std::memory_order_relaxed);
+                q0_done.store(true, std::memory_order_relaxed);
+                std::fprintf(stderr,
+                             "[error] Q0Ctrl_1 wait failed: %s\n",
+                             ex.what());
+                std::fflush(stderr);
+            }
+        });
+
+        std::thread graph_wait_thread;
+        graph_wait_thread = std::thread([&]() {
+            const auto wait_t0 = Clock::now();
+            std::printf("[stage] graphOursPLQ0.wait begin\n");
+            std::fflush(stdout);
+            try {
+                graphOursPLQ0.wait();
+                graph_wait_elapsed = elapsed_us(wait_t0, Clock::now());
+                graph_done.store(true, std::memory_order_relaxed);
+                std::printf("[stage] graphOursPLQ0.wait done (%lld us)\n",
+                            graph_wait_elapsed);
+                std::fflush(stdout);
+            } catch (const std::exception& ex) {
+                graph_wait_elapsed = elapsed_us(wait_t0, Clock::now());
+                graph_failed.store(true, std::memory_order_relaxed);
+                graph_done.store(true, std::memory_order_relaxed);
+                std::fprintf(stderr,
+                             "[error] graphOursPLQ0.wait failed: %s\n",
+                             ex.what());
+                std::fflush(stderr);
+            }
+        });
+
+        auto all_toppl_done = [&]() {
+            for (int i = 0; i < PL_WORKERS; ++i) {
+                if (!toppl_done[i].load(std::memory_order_relaxed)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        while (!all_toppl_done() ||
+               !q0_done.load(std::memory_order_relaxed) ||
+               !graph_done.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(DIAG_POLL_MS));
+            output_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            std::printf("[diag] wait_status elapsed_ms=%lld graph=%s%s q0=%s%s toppl=",
+                        elapsed_us(stage_t0, Clock::now()) / 1000,
+                        graph_done.load(std::memory_order_relaxed) ? "done" : "pending",
+                        graph_failed.load(std::memory_order_relaxed) ? "(failed)" : "",
+                        q0_done.load(std::memory_order_relaxed) ? "done" : "pending",
+                        q0_failed.load(std::memory_order_relaxed) ? "(failed)" : "");
+            for (int i = 0; i < PL_WORKERS; ++i) {
+                std::printf("%s%d:%s%s",
+                            (i == 0) ? "[" : " ",
+                            i,
+                            toppl_done[i].load(std::memory_order_relaxed) ? "done" : "pending",
+                            toppl_failed[i].load(std::memory_order_relaxed) ? "(failed)" : "");
+            }
+            std::printf("]");
+            print_debug_status(output_map);
+            std::printf("\n");
+            std::fflush(stdout);
+        }
+
+        for (int i = 0; i < PL_WORKERS; ++i) {
+            toppl_wait_threads[i].join();
+            timing.toppl_wait_us =
+                std::max(timing.toppl_wait_us, toppl_wait_elapsed[i]);
+        }
+        q0_wait_thread.join();
+        if (graph_wait_thread.joinable()) {
+            graph_wait_thread.join();
+        }
+        timing.q0_wait_us = q0_wait_elapsed;
+        timing.graph_wait_us = graph_wait_elapsed;
+        timing.wait_all_us = elapsed_us(stage_t0, Clock::now());
+
+        bool any_wait_failed =
+            q0_failed.load(std::memory_order_relaxed) ||
+            graph_failed.load(std::memory_order_relaxed);
+        for (int i = 0; i < PL_WORKERS; ++i) {
+            any_wait_failed =
+                any_wait_failed ||
+                toppl_failed[i].load(std::memory_order_relaxed);
+        }
+        if (any_wait_failed) {
+            throw std::runtime_error("TopPL, Q0Ctrl, or graph wait failed");
+        }
+
+        std::printf("[stage] graphOursPLQ0.end begin\n");
+        std::fflush(stdout);
         graphOursPLQ0.end();
+        std::printf("[stage] graphOursPLQ0.end done\n");
+        std::fflush(stdout);
+
 
         const auto t1 = Clock::now();
-        const long long dur_us = elapsed_us(t0, t1);
+        const long long kernel_phase_us = elapsed_us(t0, t1);
 
         stage_t0 = Clock::now();
         output_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         timing.bo_from_device_us = elapsed_us(stage_t0, Clock::now());
+        const long long total_us = elapsed_us(t0, Clock::now());
         std::vector<float> got(output_map, output_map + srad_cfg::kOutputElems);
         print_preview("output preview:", got);
         compare_output(got, ref.j_next);
 
         print_toppl_timing(timing);
-        print_stage_timing("GraphOurs",
-                           timing.toppl_wait_us,
-                           timing.graph_wait_us,
-                           timing.bo_from_device_us);
-        std::printf("staged graph/PL time: %lld us\n", dur_us);
+        std::printf("wait timing us: all=%lld toppl_max=%lld q0=%lld graph=%lld\n",
+                    timing.wait_all_us,
+                    timing.toppl_wait_us,
+                    timing.q0_wait_us,
+                    timing.graph_wait_us);
+        std::printf("staged graph/PL time before d2h: %lld us\n",
+                    kernel_phase_us);
 
-        std::printf("timing us: h2d=%lld submit=%lld toppl_plio=%lld graph_wait=%lld d2h=%lld total=%lld\n",
+        std::printf("timing us: h2d=%lld submit=%lld wait_all=%lld toppl_max=%lld q0_wait=%lld graph_wait=%lld d2h=%lld total=%lld\n",
                     timing.bo_to_device_us,
                     timing.submit_us,
+                    timing.wait_all_us,
                     timing.toppl_wait_us,
+                    timing.q0_wait_us,
                     timing.graph_wait_us,
                     timing.bo_from_device_us,
-                    dur_us);
+                    total_us);
 
         CommonTiming common;
         common.data_transfer_us =
             timing.bo_to_device_us + timing.bo_from_device_us;
-        common.logic_compute_us =
-            timing.toppl_wait_us + timing.graph_wait_us;
-        common.end_to_end_us = dur_us;
+        common.logic_compute_us = timing.wait_all_us;
+        common.end_to_end_us = total_us;
         print_common_timing(common);
 
         dump_float_file(output_path, got);
 
         xrtDeviceClose(dhdl);
+        dhdl = nullptr;
     } catch (const std::exception& ex) {
+        if (dhdl) {
+            xrtDeviceClose(dhdl);
+        }
         std::fprintf(stderr, "[error] XRT/AIE execution failed: %s\n", ex.what());
         return EXIT_FAILURE;
     }

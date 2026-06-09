@@ -1,7 +1,7 @@
 This directory contains the PL side of the Ours SRAD worker-Q0 validation
 mapping.
 
-`TopPLWorker.cpp` is instantiated four times. Each worker handles one AIE
+`TopPL.cpp` is instantiated four times. Each CU handles one AIE
 lane, streams one 19x24 halo-padded J tile per graph firing, stores the
 returned 16x16 J_next tile into DDR, and sends partial sum/sum2 statistics.
 

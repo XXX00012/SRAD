@@ -9,9 +9,9 @@ namespace {
 using plio_word_t = ap_uint<64>;
 
 static_assert(srad_cfg::kWorkerLanes == 50,
-              "ours_400 TopPLWorker expects 50 lanes per worker");
+              "ours_400 TopPL expects 50 lanes per worker");
 static_assert(srad_cfg::kWorkerOutputGroups == 25,
-              "ours_400 TopPLWorker expects 25 pktmerge output groups");
+              "ours_400 TopPL expects 25 pktmerge output groups");
 static_assert(srad_cfg::kWorkerOutputGroups *
                   srad_cfg::kOutputLanesPerPlio ==
               srad_cfg::kWorkerLanes,
@@ -441,7 +441,7 @@ int active_iterations(int iter_cnt) {
 
 extern "C" {
 
-void TopPLWorker(
+void TopPL(
     float* image,
     float* output,
     int iter_cnt,

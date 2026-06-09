@@ -9,21 +9,16 @@
 
 using namespace adf;
 
-// Ours SRAD AIE graph:
-//   shared full halo tile with q0sqr embedded in padding -> srad_local_q ->
-//       center/south/east coeff value-tag planes
-//   shared full halo tile + coeff value-tags ->
-//       srad_coeff_update -> J_next
+// Generated Ours400 SRAD AIE graph:
+//   200 lanes over a 250x250 16x16 tile grid for 4000x4000 input.
+//   Each lane uses srad_local_q -> srad_coeff_update on adjacent AIE rows.
+//   Four lanes fit in one AIE column when kAieArrayRows == 8.
 //
-// Each lane consumes one 19x24 halo-padded input tile from one J PLIO, then
-// that lane's tile is fanned out to both compute kernels. Both kernels consume
-// the full tile and emit one 16x16 output tile. q0sqr is stored in the first
-// padding column of the input tile, so no separate q0 PLIO is required. PL is
-// responsible for tile-major packing and boundary padding, so AIE does not use
-// input margins.
-//
-// K2 recomputes dN/dS/dW/dE from its J input, so no gradient package is routed
-// between K1 and K2 and no d_c/dN/dS/dW/dE array is exposed through PLIO/DDR.
+// One graph firing consumes one 19x24 halo-padded input tile from one J PLIO
+// that is fanned out to both compute kernels. q0sqr is stored in the first
+// padding column of the input tile, so no separate q0 PLIO is required. AIE
+// output uses pktmerge<2> so 200 lanes
+// return through 100 output PLIOs.
 namespace srad_plio_files {
 inline std::string j_in(int lane) {
     return "./data/plio_ours_j_tile_" + std::to_string(lane) + ".txt";
@@ -41,6 +36,13 @@ inline std::string j_next_out_group(int group) {
 class SradCoreGraph : public graph {
 public:
     static constexpr int kNumLanes = srad_cfg::kParallelLanes;
+
+    static_assert(kNumLanes == 200,
+                  "ours_400 generated graph expects 200 lanes");
+    static_assert(srad_cfg::kAieArrayRows == 8,
+                  "ours_400 generated graph expects 8 AIE rows");
+    static_assert(srad_cfg::kKernelsPerParallelLane == 2,
+                  "ours_400 lanes use K1/K2 adjacent kernels");
 
     port<input> in_j_k1[kNumLanes];
     port<input> in_j_k2[kNumLanes];

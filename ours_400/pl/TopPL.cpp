@@ -4,16 +4,19 @@
 #include <hls_stream.h>
 #include <cstdint>
 
-// Ours_400 PL shim:
-//   DDR image -> PL q0sqr -> 200 q0-in-padding J tile streams for AIE ->
-//   100 pktmerge<2> result streams + tile stats -> DDR. Multi-iteration runs
-//   ping-pong between image/output buffers; q0sqr after the first iteration
-//   comes from AIE tile stats.
-
 namespace {
 
 using plio_word_t = ap_uint<64>;
 
+static_assert(srad_cfg::kWorkerLanes == 20,
+              "ours_400 TopPL expects 20 AIE lanes per worker");
+static_assert(srad_cfg::kWorkerGroupLanes == 4,
+              "ours_400 TopPL expects 4 lanes per internal worker group");
+static_assert(srad_cfg::kOutputLanesPerPlio == 2,
+              "ours_400 TopPL expects pktmerge<2> AIE output");
+static_assert(srad_cfg::kWorkerOutputGroups ==
+                  srad_cfg::kWorkerLanes / srad_cfg::kOutputLanesPerPlio,
+              "TopPL output groups must cover all worker lanes");
 static_assert(srad_cfg::kInputRowElems % 2 == 0,
               "64-bit PLIO packing requires an even input row");
 static_assert(srad_cfg::kOutputSampleElems % 2 == 0,
@@ -22,13 +25,6 @@ static_assert(srad_cfg::kOutputTileDataElems == srad_cfg::kOutputTilePixels,
               "Output tile data must stay as the leading 16x16 payload");
 static_assert(srad_cfg::kOutputElems == srad_cfg::kPixels,
               "Ping-pong iterations require compact output to cover the full image");
-static_assert(srad_cfg::kRows % srad_cfg::kTileStrideRows == 0,
-              "Tile stats q0 path expects no partial output tile rows");
-static_assert(srad_cfg::kCols % srad_cfg::kTileStrideCols == 0,
-              "Tile stats q0 path expects no partial output tile cols");
-static_assert(srad_cfg::kOutputPlioGroups * srad_cfg::kOutputLanesPerPlio ==
-                  srad_cfg::kParallelLanes,
-              "Grouped output streams must cover every parallel lane");
 
 ap_uint<32> float_to_bits(float value) {
     union {
@@ -65,32 +61,57 @@ float unpack_lane1(plio_word_t word) {
     return bits_to_float(word.range(63, 32));
 }
 
-float compute_q0sqr_from_sums(float sum, float sum2) {
+int clamp_worker_id(int worker_id) {
 #pragma HLS INLINE
-    const float mean = sum / static_cast<float>(srad_cfg::kPixels);
-    const float variance =
-        (sum2 / static_cast<float>(srad_cfg::kPixels)) - (mean * mean);
-    return (mean != 0.0f) ? (variance / (mean * mean)) : 0.0f;
+    if (worker_id < 0) {
+        return 0;
+    }
+    if (worker_id >= srad_cfg::kTopPlWorkers) {
+        return srad_cfg::kTopPlWorkers - 1;
+    }
+    return worker_id;
 }
 
 int tile_start(int tile_idx, int stride) {
+#pragma HLS INLINE
     return tile_idx * stride;
 }
 
-int tile_linear_from_slot(int iteration, int lane) {
-    return iteration * srad_cfg::kParallelLanes + lane;
+int global_lane_from_worker(int worker_id, int local_lane) {
+#pragma HLS INLINE
+    return worker_id * srad_cfg::kWorkerLanes + local_lane;
+}
+
+int tile_linear_from_slot(int graph_iter, int global_lane) {
+#pragma HLS INLINE
+    return graph_iter * srad_cfg::kParallelLanes + global_lane;
 }
 
 bool is_valid_tile_linear(int tile_linear) {
+#pragma HLS INLINE
     return tile_linear < srad_cfg::kTotalTileCount;
 }
 
 int tile_row_from_linear(int tile_linear) {
+#pragma HLS INLINE
     return tile_linear / srad_cfg::kTileColCount;
 }
 
 int tile_col_from_linear(int tile_linear) {
+#pragma HLS INLINE
     return tile_linear % srad_cfg::kTileColCount;
+}
+
+void tile_origin(int tile_linear,
+                 bool& valid_tile,
+                 int& tile_row_start,
+                 int& tile_col_start) {
+#pragma HLS INLINE
+    valid_tile = is_valid_tile_linear(tile_linear);
+    const int tile_r = valid_tile ? tile_row_from_linear(tile_linear) : 0;
+    const int tile_c = valid_tile ? tile_col_from_linear(tile_linear) : 0;
+    tile_row_start = tile_start(tile_r, srad_cfg::kTileStrideRows);
+    tile_col_start = tile_start(tile_c, srad_cfg::kTileStrideCols);
 }
 
 void write_j_tile_row(const float* image,
@@ -140,6 +161,29 @@ void write_j_tile_row(const float* image,
     }
 }
 
+void write_one_tile(const float* image,
+                    hls::stream<plio_word_t>& out_j,
+                    int tile_linear,
+                    float q0sqr) {
+#pragma HLS INLINE off
+    bool valid_tile = false;
+    int tile_row_start = 0;
+    int tile_col_start = 0;
+    tile_origin(tile_linear, valid_tile, tile_row_start, tile_col_start);
+
+    for (int local_row = 0;
+         local_row < srad_cfg::kInputLogicalRows;
+         ++local_row) {
+        write_j_tile_row(image,
+                         out_j,
+                         tile_row_start,
+                         tile_col_start,
+                         local_row,
+                         q0sqr,
+                         valid_tile);
+    }
+}
+
 void maybe_store_valid(float* output,
                        int tile_row_start,
                        int tile_col_start,
@@ -170,69 +214,34 @@ void read_j_next_tile(float* output,
                       float& tile_sum2) {
     tile_sum = 0.0f;
     tile_sum2 = 0.0f;
+
     for (int r = 0; r < srad_cfg::kOutputTileRows; ++r) {
         for (int c = 0; c < srad_cfg::kOutputTileCols; c += 2) {
 #pragma HLS PIPELINE II=1
             const plio_word_t word = in_j_next.read();
             if (valid_tile) {
+                const float v0 = unpack_lane0(word);
+                const float v1 = unpack_lane1(word);
                 maybe_store_valid(output,
                                   tile_row_start,
                                   tile_col_start,
                                   r,
                                   c,
-                                  unpack_lane0(word));
+                                  v0);
                 maybe_store_valid(output,
                                   tile_row_start,
                                   tile_col_start,
                                   r,
                                   c + 1,
-                                  unpack_lane1(word));
+                                  v1);
             }
         }
     }
 
     const plio_word_t stat_word = in_j_next.read();
-    tile_sum = unpack_lane0(stat_word);
-    tile_sum2 = unpack_lane1(stat_word);
-}
-
-void write_one_tile(const float* image,
-                    hls::stream<plio_word_t>& out_j,
-                    int tile_linear,
-                    float q0sqr) {
-#pragma HLS INLINE off
-    const bool valid_tile = is_valid_tile_linear(tile_linear);
-    const int tile_r = valid_tile ? tile_row_from_linear(tile_linear) : 0;
-    const int tile_c = valid_tile ? tile_col_from_linear(tile_linear) : 0;
-    const int tile_row_start =
-        tile_start(tile_r, srad_cfg::kTileStrideRows);
-    const int tile_col_start =
-        tile_start(tile_c, srad_cfg::kTileStrideCols);
-
-    for (int local_row = 0;
-         local_row < srad_cfg::kInputLogicalRows;
-         ++local_row) {
-        write_j_tile_row(image,
-                         out_j,
-                         tile_row_start,
-                         tile_col_start,
-                         local_row,
-                         q0sqr,
-                         valid_tile);
-    }
-}
-
-void write_all_lane_tiles(
-    const float* image,
-    hls::stream<plio_word_t> out_j[srad_cfg::kParallelLanes],
-    float q0sqr) {
-#pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=out_j complete dim=1
-    for (int it = 0; it < srad_cfg::kGraphRunIterations; ++it) {
-        for (int lane = 0; lane < srad_cfg::kParallelLanes; ++lane) {
-            const int tile_linear = tile_linear_from_slot(it, lane);
-            write_one_tile(image, out_j[lane], tile_linear, q0sqr);
-        }
+    if (valid_tile) {
+        tile_sum = unpack_lane0(stat_word);
+        tile_sum2 = unpack_lane1(stat_word);
     }
 }
 
@@ -240,16 +249,12 @@ void read_one_tile(float* output,
                    hls::stream<plio_word_t>& in_j_next,
                    int tile_linear,
                    float& tile_sum,
-                   float& tile_sum2,
-                   bool& valid_tile) {
+                   float& tile_sum2) {
 #pragma HLS INLINE off
-    valid_tile = is_valid_tile_linear(tile_linear);
-    const int tile_r = valid_tile ? tile_row_from_linear(tile_linear) : 0;
-    const int tile_c = valid_tile ? tile_col_from_linear(tile_linear) : 0;
-    const int tile_row_start =
-        tile_start(tile_r, srad_cfg::kTileStrideRows);
-    const int tile_col_start =
-        tile_start(tile_c, srad_cfg::kTileStrideCols);
+    bool valid_tile = false;
+    int tile_row_start = 0;
+    int tile_col_start = 0;
+    tile_origin(tile_linear, valid_tile, tile_row_start, tile_col_start);
 
     read_j_next_tile(output,
                      in_j_next,
@@ -260,78 +265,699 @@ void read_one_tile(float* output,
                      tile_sum2);
 }
 
-void read_all_group_tiles(
-    float* output,
-    hls::stream<plio_word_t> in_j_next[srad_cfg::kOutputPlioGroups],
-    float& sum,
-    float& sum2) {
+void load_j_tile_row(const float* image,
+                     float tile_buf[srad_cfg::kImageInputSampleElems],
+                     int tile_row_start,
+                     int tile_col_start,
+                     int local_row,
+                     float q0sqr,
+                     bool valid_tile) {
+    const int image_row =
+        tile_row_start + local_row - srad_cfg::kHaloTopRows;
+
+    for (int c = 0; c < srad_cfg::kInputRowElems; ++c) {
+#pragma HLS PIPELINE II=1
+        float v = 0.0f;
+
+        if (valid_tile &&
+            image_row >= 0 && image_row < srad_cfg::kRows &&
+            c < srad_cfg::kInputLogicalCols) {
+            const int image_col =
+                tile_col_start + c - srad_cfg::kHaloLeftCols;
+            if (image_col >= 0 && image_col < srad_cfg::kCols) {
+                v = image[image_row * srad_cfg::kCols + image_col];
+            }
+        }
+
+        if (local_row == srad_cfg::kQ0SqrTileRow &&
+            c == srad_cfg::kQ0SqrTileCol) {
+            v = q0sqr;
+        }
+
+        tile_buf[local_row * srad_cfg::kInputRowElems + c] = v;
+    }
+}
+
+void load_one_tile_buffer(const float* image,
+                          float tile_buf[srad_cfg::kImageInputSampleElems],
+                          int tile_linear,
+                          float q0sqr) {
 #pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=in_j_next complete dim=1
-    sum = 0.0f;
-    sum2 = 0.0f;
+    bool valid_tile = false;
+    int tile_row_start = 0;
+    int tile_col_start = 0;
+    tile_origin(tile_linear, valid_tile, tile_row_start, tile_col_start);
 
-    for (int it = 0; it < srad_cfg::kGraphRunIterations; ++it) {
-        for (int group = 0; group < srad_cfg::kOutputPlioGroups; ++group) {
-            for (int local = 0;
-                 local < srad_cfg::kOutputLanesPerPlio;
-                 ++local) {
-                const int lane =
-                    group * srad_cfg::kOutputLanesPerPlio + local;
-                const int tile_linear = tile_linear_from_slot(it, lane);
-                float tile_sum = 0.0f;
-                float tile_sum2 = 0.0f;
-                bool valid_tile = false;
+    for (int local_row = 0;
+         local_row < srad_cfg::kInputLogicalRows;
+         ++local_row) {
+        load_j_tile_row(image,
+                        tile_buf,
+                        tile_row_start,
+                        tile_col_start,
+                        local_row,
+                        q0sqr,
+                        valid_tile);
+    }
+}
 
-                read_one_tile(output,
-                              in_j_next[group],
-                              tile_linear,
-                              tile_sum,
-                              tile_sum2,
-                              valid_tile);
-                if (valid_tile) {
-                    sum += tile_sum;
-                    sum2 += tile_sum2;
-                }
+void load_lane_tile_buffer(const float* image,
+                           float tile_buf[srad_cfg::kImageInputSampleElems],
+                           int worker_id,
+                           int local_lane,
+                           int graph_iter,
+                           float q0sqr) {
+#pragma HLS INLINE off
+    const int global_lane = global_lane_from_worker(worker_id, local_lane);
+    const int tile_linear = tile_linear_from_slot(graph_iter, global_lane);
+    load_one_tile_buffer(image, tile_buf, tile_linear, q0sqr);
+}
+
+void stream_one_tile_buffer(
+    const float tile_buf[srad_cfg::kImageInputSampleElems],
+    hls::stream<plio_word_t>& out_j) {
+#pragma HLS INLINE off
+    for (int i = 0; i < srad_cfg::kImageInputSampleElems; i += 2) {
+#pragma HLS PIPELINE II=1
+        out_j.write(pack_two_floats(tile_buf[i], tile_buf[i + 1]));
+    }
+}
+
+void capture_one_tile_buffer(
+    hls::stream<plio_word_t>& in_j_next,
+    float tile_buf[srad_cfg::kOutputTileDataElems],
+    float& tile_sum,
+    float& tile_sum2) {
+#pragma HLS INLINE off
+    for (int i = 0; i < srad_cfg::kOutputTileDataElems; i += 2) {
+#pragma HLS PIPELINE II=1
+        const plio_word_t word = in_j_next.read();
+        tile_buf[i] = unpack_lane0(word);
+        tile_buf[i + 1] = unpack_lane1(word);
+    }
+
+    const plio_word_t stat_word = in_j_next.read();
+    tile_sum = unpack_lane0(stat_word);
+    tile_sum2 = unpack_lane1(stat_word);
+}
+
+void store_one_tile_buffer(
+    float* output,
+    const float tile_buf[srad_cfg::kOutputTileDataElems],
+    int tile_linear) {
+#pragma HLS INLINE off
+    bool valid_tile = false;
+    int tile_row_start = 0;
+    int tile_col_start = 0;
+    tile_origin(tile_linear, valid_tile, tile_row_start, tile_col_start);
+    if (!valid_tile) {
+        return;
+    }
+
+    for (int r = 0; r < srad_cfg::kOutputTileRows; ++r) {
+        for (int c = 0; c < srad_cfg::kOutputTileCols; ++c) {
+#pragma HLS PIPELINE II=1
+            const float value = tile_buf[r * srad_cfg::kOutputTileCols + c];
+            maybe_store_valid(output,
+                              tile_row_start,
+                              tile_col_start,
+                              r,
+                              c,
+                              value);
+        }
+    }
+}
+
+void store_lane_tile_buffer(
+    float* output,
+    const float tile_buf[srad_cfg::kOutputTileDataElems],
+    int worker_id,
+    int local_lane,
+    int graph_iter) {
+#pragma HLS INLINE off
+    const int global_lane = global_lane_from_worker(worker_id, local_lane);
+    const int tile_linear = tile_linear_from_slot(graph_iter, global_lane);
+    store_one_tile_buffer(output, tile_buf, tile_linear);
+}
+
+bool is_interior_input_tile(bool valid_tile,
+                            int tile_row_start,
+                            int tile_col_start) {
+#pragma HLS INLINE
+    return valid_tile &&
+           tile_row_start >= srad_cfg::kHaloTopRows &&
+           (tile_row_start + srad_cfg::kOutputTileRows +
+            srad_cfg::kHaloBottomRows - 1) < srad_cfg::kRows &&
+           tile_col_start >= srad_cfg::kHaloLeftCols &&
+           (tile_col_start + srad_cfg::kOutputTileCols +
+            srad_cfg::kHaloRightCols - 1) < srad_cfg::kCols;
+}
+
+bool is_full_output_tile(bool valid_tile,
+                         int tile_row_start,
+                         int tile_col_start) {
+#pragma HLS INLINE
+    return valid_tile &&
+           tile_row_start >= srad_cfg::kOutputFirstRow &&
+           (tile_row_start + srad_cfg::kOutputTileRows - 1) <=
+               srad_cfg::kOutputLastRow &&
+           tile_col_start >= srad_cfg::kOutputFirstCol &&
+           (tile_col_start + srad_cfg::kOutputTileCols - 1) <=
+               srad_cfg::kOutputLastCol;
+}
+
+float read_input_sample_fast(const float* image,
+                             int tile_row_start,
+                             int tile_col_start,
+                             int local_row,
+                             int physical_col,
+                             float q0sqr) {
+#pragma HLS INLINE
+    if (local_row == srad_cfg::kQ0SqrTileRow &&
+        physical_col == srad_cfg::kQ0SqrTileCol) {
+        return q0sqr;
+    }
+    if (physical_col >= srad_cfg::kInputLogicalCols) {
+        return 0.0f;
+    }
+
+    const int image_row =
+        tile_row_start + local_row - srad_cfg::kHaloTopRows;
+    const int image_col =
+        tile_col_start + physical_col - srad_cfg::kHaloLeftCols;
+    return image[image_row * srad_cfg::kCols + image_col];
+}
+
+float read_input_sample_boundary(const float* image,
+                                 int tile_row_start,
+                                 int tile_col_start,
+                                 int local_row,
+                                 int physical_col,
+                                 float q0sqr,
+                                 bool valid_tile) {
+#pragma HLS INLINE
+    if (local_row == srad_cfg::kQ0SqrTileRow &&
+        physical_col == srad_cfg::kQ0SqrTileCol) {
+        return q0sqr;
+    }
+    if (!valid_tile || physical_col >= srad_cfg::kInputLogicalCols) {
+        return 0.0f;
+    }
+
+    const int image_row =
+        tile_row_start + local_row - srad_cfg::kHaloTopRows;
+    const int image_col =
+        tile_col_start + physical_col - srad_cfg::kHaloLeftCols;
+    if (image_row < 0 || image_row >= srad_cfg::kRows ||
+        image_col < 0 || image_col >= srad_cfg::kCols) {
+        return 0.0f;
+    }
+    return image[image_row * srad_cfg::kCols + image_col];
+}
+
+plio_word_t make_input_word(const float* image,
+                            int tile_row_start,
+                            int tile_col_start,
+                            int local_row,
+                            int physical_col,
+                            float q0sqr,
+                            bool valid_tile,
+                            bool interior_tile) {
+#pragma HLS INLINE
+    const float v0 =
+        interior_tile
+            ? read_input_sample_fast(image,
+                                     tile_row_start,
+                                     tile_col_start,
+                                     local_row,
+                                     physical_col,
+                                     q0sqr)
+            : read_input_sample_boundary(image,
+                                         tile_row_start,
+                                         tile_col_start,
+                                         local_row,
+                                         physical_col,
+                                         q0sqr,
+                                         valid_tile);
+    const float v1 =
+        interior_tile
+            ? read_input_sample_fast(image,
+                                     tile_row_start,
+                                     tile_col_start,
+                                     local_row,
+                                     physical_col + 1,
+                                     q0sqr)
+            : read_input_sample_boundary(image,
+                                         tile_row_start,
+                                         tile_col_start,
+                                         local_row,
+                                         physical_col + 1,
+                                         q0sqr,
+                                         valid_tile);
+    return pack_two_floats(v0, v1);
+}
+
+void lane_origin_for_group(int worker_id,
+                           int lane_base,
+                           int lane_offset,
+                           int graph_iter,
+                           bool& valid_tile,
+                           bool& interior_tile,
+                           bool& full_output_tile,
+                           int& tile_row_start,
+                           int& tile_col_start) {
+#pragma HLS INLINE
+    const int global_lane =
+        global_lane_from_worker(worker_id, lane_base + lane_offset);
+    const int tile_linear = tile_linear_from_slot(graph_iter, global_lane);
+    tile_origin(tile_linear, valid_tile, tile_row_start, tile_col_start);
+    interior_tile =
+        is_interior_input_tile(valid_tile, tile_row_start, tile_col_start);
+    full_output_tile =
+        is_full_output_tile(valid_tile, tile_row_start, tile_col_start);
+}
+
+void stream_group_j_tiles(const float* image,
+                          int worker_id,
+                          int lane_base,
+                          float q0sqr,
+                          hls::stream<plio_word_t>& out_j_0,
+                          hls::stream<plio_word_t>& out_j_1,
+                          hls::stream<plio_word_t>& out_j_2,
+                          hls::stream<plio_word_t>& out_j_3) {
+#pragma HLS INLINE off
+    for (int graph_iter = 0;
+         graph_iter < srad_cfg::kGraphRunIterations;
+         ++graph_iter) {
+        bool valid_0 = false;
+        bool valid_1 = false;
+        bool valid_2 = false;
+        bool valid_3 = false;
+        bool interior_0 = false;
+        bool interior_1 = false;
+        bool interior_2 = false;
+        bool interior_3 = false;
+        bool full_output_unused = false;
+        int row_0 = 0;
+        int row_1 = 0;
+        int row_2 = 0;
+        int row_3 = 0;
+        int col_0 = 0;
+        int col_1 = 0;
+        int col_2 = 0;
+        int col_3 = 0;
+
+        lane_origin_for_group(worker_id, lane_base, 0, graph_iter,
+                              valid_0, interior_0, full_output_unused,
+                              row_0, col_0);
+        lane_origin_for_group(worker_id, lane_base, 1, graph_iter,
+                              valid_1, interior_1, full_output_unused,
+                              row_1, col_1);
+        lane_origin_for_group(worker_id, lane_base, 2, graph_iter,
+                              valid_2, interior_2, full_output_unused,
+                              row_2, col_2);
+        lane_origin_for_group(worker_id, lane_base, 3, graph_iter,
+                              valid_3, interior_3, full_output_unused,
+                              row_3, col_3);
+
+        for (int local_row = 0;
+             local_row < srad_cfg::kInputLogicalRows;
+             ++local_row) {
+            for (int c = 0; c < srad_cfg::kInputRowElems; c += 2) {
+#pragma HLS PIPELINE II=1
+                out_j_0.write(make_input_word(image, row_0, col_0, local_row,
+                                               c, q0sqr, valid_0, interior_0));
+                out_j_1.write(make_input_word(image, row_1, col_1, local_row,
+                                               c, q0sqr, valid_1, interior_1));
+                out_j_2.write(make_input_word(image, row_2, col_2, local_row,
+                                               c, q0sqr, valid_2, interior_2));
+                out_j_3.write(make_input_word(image, row_3, col_3, local_row,
+                                               c, q0sqr, valid_3, interior_3));
             }
         }
     }
 }
 
-float compute_initial_q0sqr(const float* image) {
-#pragma HLS INLINE off
-    float sum = 0.0f;
-    float sum2 = 0.0f;
-
-    for (int i = 0; i < srad_cfg::kPixels; ++i) {
-#pragma HLS PIPELINE II=1
-        const float v = image[i];
-        sum += v;
-        sum2 += v * v;
+void store_output_word(float* output,
+                       int tile_row_start,
+                       int tile_col_start,
+                       int local_row,
+                       int local_col,
+                       plio_word_t word,
+                       bool valid_tile,
+                       bool full_output_tile) {
+#pragma HLS INLINE
+    if (!valid_tile) {
+        return;
     }
 
-    return compute_q0sqr_from_sums(sum, sum2);
+    const float v0 = unpack_lane0(word);
+    const float v1 = unpack_lane1(word);
+    if (full_output_tile) {
+        const int output_row =
+            tile_row_start + local_row - srad_cfg::kOutputFirstRow;
+        const int output_col =
+            tile_col_start + local_col - srad_cfg::kOutputFirstCol;
+        const int idx = output_row * srad_cfg::kOutputCols + output_col;
+        output[idx] = v0;
+        output[idx + 1] = v1;
+    } else {
+        maybe_store_valid(output, tile_row_start, tile_col_start, local_row,
+                          local_col, v0);
+        maybe_store_valid(output, tile_row_start, tile_col_start, local_row,
+                          local_col + 1, v1);
+    }
 }
 
-void run_one_iteration(
+void capture_group_j_next_tiles(float* output,
+                                int worker_id,
+                                int lane_base,
+                                hls::stream<plio_word_t>& in_j_next_0,
+                                hls::stream<plio_word_t>& in_j_next_1,
+                                float& sum,
+                                float& sum2) {
+#pragma HLS INLINE off
+    sum = 0.0f;
+    sum2 = 0.0f;
+
+    for (int graph_iter = 0;
+         graph_iter < srad_cfg::kGraphRunIterations;
+         ++graph_iter) {
+        bool valid_0 = false;
+        bool valid_1 = false;
+        bool valid_2 = false;
+        bool valid_3 = false;
+        bool interior_unused = false;
+        bool full_0 = false;
+        bool full_1 = false;
+        bool full_2 = false;
+        bool full_3 = false;
+        int row_0 = 0;
+        int row_1 = 0;
+        int row_2 = 0;
+        int row_3 = 0;
+        int col_0 = 0;
+        int col_1 = 0;
+        int col_2 = 0;
+        int col_3 = 0;
+
+        lane_origin_for_group(worker_id, lane_base, 0, graph_iter,
+                              valid_0, interior_unused, full_0, row_0, col_0);
+        lane_origin_for_group(worker_id, lane_base, 1, graph_iter,
+                              valid_1, interior_unused, full_1, row_1, col_1);
+        lane_origin_for_group(worker_id, lane_base, 2, graph_iter,
+                              valid_2, interior_unused, full_2, row_2, col_2);
+        lane_origin_for_group(worker_id, lane_base, 3, graph_iter,
+                              valid_3, interior_unused, full_3, row_3, col_3);
+
+        for (int r = 0; r < srad_cfg::kOutputTileRows; ++r) {
+            for (int c = 0; c < srad_cfg::kOutputTileCols; c += 2) {
+#pragma HLS PIPELINE II=1
+                const plio_word_t word_0 = in_j_next_0.read();
+                const plio_word_t word_1 = in_j_next_1.read();
+                store_output_word(output, row_0, col_0, r, c, word_0,
+                                  valid_0, full_0);
+                store_output_word(output, row_2, col_2, r, c, word_1,
+                                  valid_2, full_2);
+            }
+        }
+
+        const plio_word_t stat_0 = in_j_next_0.read();
+        const plio_word_t stat_1 = in_j_next_1.read();
+        if (valid_0) {
+            sum += unpack_lane0(stat_0);
+            sum2 += unpack_lane1(stat_0);
+        }
+        if (valid_2) {
+            sum += unpack_lane0(stat_1);
+            sum2 += unpack_lane1(stat_1);
+        }
+
+        for (int r = 0; r < srad_cfg::kOutputTileRows; ++r) {
+            for (int c = 0; c < srad_cfg::kOutputTileCols; c += 2) {
+#pragma HLS PIPELINE II=1
+                const plio_word_t word_0 = in_j_next_0.read();
+                const plio_word_t word_1 = in_j_next_1.read();
+                store_output_word(output, row_1, col_1, r, c, word_0,
+                                  valid_1, full_1);
+                store_output_word(output, row_3, col_3, r, c, word_1,
+                                  valid_3, full_3);
+            }
+        }
+
+        const plio_word_t stat_2 = in_j_next_0.read();
+        const plio_word_t stat_3 = in_j_next_1.read();
+        if (valid_1) {
+            sum += unpack_lane0(stat_2);
+            sum2 += unpack_lane1(stat_2);
+        }
+        if (valid_3) {
+            sum += unpack_lane0(stat_3);
+            sum2 += unpack_lane1(stat_3);
+        }
+    }
+}
+
+void run_group_pipeline(const float* image,
+                        float* output,
+                        int worker_id,
+                        int lane_base,
+                        float q0sqr,
+                        hls::stream<plio_word_t>& out_j_0,
+                        hls::stream<plio_word_t>& out_j_1,
+                        hls::stream<plio_word_t>& out_j_2,
+                        hls::stream<plio_word_t>& out_j_3,
+                        hls::stream<plio_word_t>& in_j_next_0,
+                        hls::stream<plio_word_t>& in_j_next_1,
+                        float& sum,
+                        float& sum2) {
+#pragma HLS INLINE off
+#pragma HLS DATAFLOW
+    stream_group_j_tiles(image, worker_id, lane_base, q0sqr, out_j_0,
+                         out_j_1, out_j_2, out_j_3);
+    capture_group_j_next_tiles(output, worker_id, lane_base, in_j_next_0,
+                               in_j_next_1, sum, sum2);
+}
+
+void run_worker_iteration_optimized(
     const float* image,
     float* output,
-    hls::stream<plio_word_t> out_j[srad_cfg::kParallelLanes],
-    hls::stream<plio_word_t> in_j_next[srad_cfg::kOutputPlioGroups],
+    hls::stream<plio_word_t>& out_j_0,
+    hls::stream<plio_word_t>& out_j_1,
+    hls::stream<plio_word_t>& out_j_2,
+    hls::stream<plio_word_t>& out_j_3,
+    hls::stream<plio_word_t>& out_j_4,
+    hls::stream<plio_word_t>& out_j_5,
+    hls::stream<plio_word_t>& out_j_6,
+    hls::stream<plio_word_t>& out_j_7,
+    hls::stream<plio_word_t>& out_j_8,
+    hls::stream<plio_word_t>& out_j_9,
+    hls::stream<plio_word_t>& out_j_10,
+    hls::stream<plio_word_t>& out_j_11,
+    hls::stream<plio_word_t>& out_j_12,
+    hls::stream<plio_word_t>& out_j_13,
+    hls::stream<plio_word_t>& out_j_14,
+    hls::stream<plio_word_t>& out_j_15,
+    hls::stream<plio_word_t>& out_j_16,
+    hls::stream<plio_word_t>& out_j_17,
+    hls::stream<plio_word_t>& out_j_18,
+    hls::stream<plio_word_t>& out_j_19,
+    hls::stream<plio_word_t>& in_j_next_0,
+    hls::stream<plio_word_t>& in_j_next_1,
+    hls::stream<plio_word_t>& in_j_next_2,
+    hls::stream<plio_word_t>& in_j_next_3,
+    hls::stream<plio_word_t>& in_j_next_4,
+    hls::stream<plio_word_t>& in_j_next_5,
+    hls::stream<plio_word_t>& in_j_next_6,
+    hls::stream<plio_word_t>& in_j_next_7,
+    hls::stream<plio_word_t>& in_j_next_8,
+    hls::stream<plio_word_t>& in_j_next_9,
+    int worker_id,
     float q0sqr,
     float& next_sum,
     float& next_sum2) {
 #pragma HLS INLINE off
 #pragma HLS DATAFLOW
-    write_all_lane_tiles(image, out_j, q0sqr);
-    read_all_group_tiles(output, in_j_next, next_sum, next_sum2);
+#pragma HLS ALLOCATION function instances=run_group_pipeline limit=1
+    float group_sum[5];
+    float group_sum2[5];
+
+    run_group_pipeline(
+        image, output, worker_id, 0 * srad_cfg::kWorkerGroupLanes, q0sqr,
+        out_j_0, out_j_1,
+        out_j_2, out_j_3,
+        in_j_next_0,
+        in_j_next_1,
+        group_sum[0], group_sum2[0]);
+    run_group_pipeline(
+        image, output, worker_id, 1 * srad_cfg::kWorkerGroupLanes, q0sqr,
+        out_j_4, out_j_5,
+        out_j_6, out_j_7,
+        in_j_next_2,
+        in_j_next_3,
+        group_sum[1], group_sum2[1]);
+    run_group_pipeline(
+        image, output, worker_id, 2 * srad_cfg::kWorkerGroupLanes, q0sqr,
+        out_j_8, out_j_9,
+        out_j_10, out_j_11,
+        in_j_next_4,
+        in_j_next_5,
+        group_sum[2], group_sum2[2]);
+    run_group_pipeline(
+        image, output, worker_id, 3 * srad_cfg::kWorkerGroupLanes, q0sqr,
+        out_j_12, out_j_13,
+        out_j_14, out_j_15,
+        in_j_next_6,
+        in_j_next_7,
+        group_sum[3], group_sum2[3]);
+    run_group_pipeline(
+        image, output, worker_id, 4 * srad_cfg::kWorkerGroupLanes, q0sqr,
+        out_j_16, out_j_17,
+        out_j_18, out_j_19,
+        in_j_next_8,
+        in_j_next_9,
+        group_sum[4], group_sum2[4]);
+    next_sum = group_sum[0] + group_sum[1] + group_sum[2] + group_sum[3] + group_sum[4];
+    next_sum2 = group_sum2[0] + group_sum2[1] + group_sum2[2] + group_sum2[3] + group_sum2[4];
 }
 
-void copy_image(const float* src, float* dst) {
+void accumulate_image_tile(const float* image,
+                           int tile_linear,
+                           float& sum,
+                           float& sum2) {
 #pragma HLS INLINE off
-    for (int i = 0; i < srad_cfg::kPixels; ++i) {
-#pragma HLS PIPELINE II=1
-        dst[i] = src[i];
+    bool valid_tile = false;
+    int tile_row_start = 0;
+    int tile_col_start = 0;
+    tile_origin(tile_linear, valid_tile, tile_row_start, tile_col_start);
+    if (!valid_tile) {
+        return;
     }
+
+    for (int r = 0; r < srad_cfg::kOutputTileRows; ++r) {
+        for (int c = 0; c < srad_cfg::kOutputTileCols; ++c) {
+#pragma HLS PIPELINE II=1
+            const int global_row = tile_row_start + r;
+            const int global_col = tile_col_start + c;
+            if (global_row >= 0 && global_row < srad_cfg::kRows &&
+                global_col >= 0 && global_col < srad_cfg::kCols) {
+                const float v =
+                    image[global_row * srad_cfg::kCols + global_col];
+                sum += v;
+                sum2 += v * v;
+            }
+        }
+    }
+}
+
+void compute_initial_worker_stats(const float* image,
+                                  int worker_id,
+                                  float& sum,
+                                  float& sum2) {
+#pragma HLS INLINE off
+    sum = 0.0f;
+    sum2 = 0.0f;
+
+    for (int local_lane = 0;
+         local_lane < srad_cfg::kWorkerLanes;
+         ++local_lane) {
+        const int global_lane =
+            global_lane_from_worker(worker_id, local_lane);
+        for (int graph_iter = 0;
+             graph_iter < srad_cfg::kGraphRunIterations;
+             ++graph_iter) {
+            const int tile_linear =
+                tile_linear_from_slot(graph_iter, global_lane);
+            accumulate_image_tile(image, tile_linear, sum, sum2);
+        }
+    }
+}
+
+void compute_initial_group_stats(const float* image,
+                                 int worker_id,
+                                 int lane_base,
+                                 float& sum,
+                                 float& sum2) {
+#pragma HLS INLINE off
+    sum = 0.0f;
+    sum2 = 0.0f;
+
+    for (int local_lane = 0;
+         local_lane < srad_cfg::kWorkerGroupLanes;
+         ++local_lane) {
+        const int global_lane =
+            global_lane_from_worker(worker_id, lane_base + local_lane);
+        for (int graph_iter = 0;
+             graph_iter < srad_cfg::kGraphRunIterations;
+             ++graph_iter) {
+            const int tile_linear =
+                tile_linear_from_slot(graph_iter, global_lane);
+            accumulate_image_tile(image, tile_linear, sum, sum2);
+        }
+    }
+}
+
+void copy_one_tile(const float* src, float* dst, int tile_linear) {
+#pragma HLS INLINE off
+    bool valid_tile = false;
+    int tile_row_start = 0;
+    int tile_col_start = 0;
+    tile_origin(tile_linear, valid_tile, tile_row_start, tile_col_start);
+    if (!valid_tile) {
+        return;
+    }
+
+    for (int r = 0; r < srad_cfg::kOutputTileRows; ++r) {
+        for (int c = 0; c < srad_cfg::kOutputTileCols; ++c) {
+#pragma HLS PIPELINE II=1
+            const int global_row = tile_row_start + r;
+            const int global_col = tile_col_start + c;
+            if (global_row >= 0 && global_row < srad_cfg::kRows &&
+                global_col >= 0 && global_col < srad_cfg::kCols) {
+                const int idx = global_row * srad_cfg::kCols + global_col;
+                dst[idx] = src[idx];
+            }
+        }
+    }
+}
+
+void copy_worker_tiles(const float* src, float* dst, int worker_id) {
+#pragma HLS INLINE off
+    for (int local_lane = 0;
+         local_lane < srad_cfg::kWorkerLanes;
+         ++local_lane) {
+        const int global_lane =
+            global_lane_from_worker(worker_id, local_lane);
+        for (int graph_iter = 0;
+             graph_iter < srad_cfg::kGraphRunIterations;
+             ++graph_iter) {
+            const int tile_linear =
+                tile_linear_from_slot(graph_iter, global_lane);
+            copy_one_tile(src, dst, tile_linear);
+        }
+    }
+}
+
+int active_iterations(int iter_cnt) {
+#pragma HLS INLINE
+    int active_iters = iter_cnt;
+    if (active_iters < 1) {
+        active_iters = 1;
+    }
+    if (active_iters > srad_cfg::kSradIterations) {
+        active_iters = srad_cfg::kSradIterations;
+    }
+    return active_iters;
+}
+
+int debug_status_index(int worker_id) {
+#pragma HLS INLINE
+    return srad_cfg::kOutputElems + worker_id;
+}
+
+void write_debug_status(float* output, int worker_id, float status) {
+#pragma HLS INLINE
+    output[debug_status_index(worker_id)] = status;
 }
 
 } // namespace
@@ -341,59 +967,236 @@ extern "C" {
 void TopPL(float* image,
            float* output,
            int iter_cnt,
-           hls::stream<plio_word_t> out_j[srad_cfg::kParallelLanes],
-           hls::stream<plio_word_t> in_j_next[srad_cfg::kOutputPlioGroups]) {
+           int worker_id_arg,
+           hls::stream<plio_word_t>& out_j_0,
+           hls::stream<plio_word_t>& out_j_1,
+           hls::stream<plio_word_t>& out_j_2,
+           hls::stream<plio_word_t>& out_j_3,
+           hls::stream<plio_word_t>& out_j_4,
+           hls::stream<plio_word_t>& out_j_5,
+           hls::stream<plio_word_t>& out_j_6,
+           hls::stream<plio_word_t>& out_j_7,
+           hls::stream<plio_word_t>& out_j_8,
+           hls::stream<plio_word_t>& out_j_9,
+           hls::stream<plio_word_t>& out_j_10,
+           hls::stream<plio_word_t>& out_j_11,
+           hls::stream<plio_word_t>& out_j_12,
+           hls::stream<plio_word_t>& out_j_13,
+           hls::stream<plio_word_t>& out_j_14,
+           hls::stream<plio_word_t>& out_j_15,
+           hls::stream<plio_word_t>& out_j_16,
+           hls::stream<plio_word_t>& out_j_17,
+           hls::stream<plio_word_t>& out_j_18,
+           hls::stream<plio_word_t>& out_j_19,
+           hls::stream<plio_word_t>& in_j_next_0,
+           hls::stream<plio_word_t>& in_j_next_1,
+           hls::stream<plio_word_t>& in_j_next_2,
+           hls::stream<plio_word_t>& in_j_next_3,
+           hls::stream<plio_word_t>& in_j_next_4,
+           hls::stream<plio_word_t>& in_j_next_5,
+           hls::stream<plio_word_t>& in_j_next_6,
+           hls::stream<plio_word_t>& in_j_next_7,
+           hls::stream<plio_word_t>& in_j_next_8,
+           hls::stream<plio_word_t>& in_j_next_9,
+           hls::stream<plio_word_t>& stat_to_q0,
+           hls::stream<plio_word_t>& q0_from_ctrl) {
 #pragma HLS INTERFACE m_axi port=image offset=slave bundle=gmem0
 #pragma HLS INTERFACE m_axi port=output offset=slave bundle=gmem1
-#pragma HLS INTERFACE axis port=out_j
-#pragma HLS INTERFACE axis port=in_j_next
-#pragma HLS ARRAY_PARTITION variable=out_j complete dim=1
-#pragma HLS ARRAY_PARTITION variable=in_j_next complete dim=1
+#pragma HLS INTERFACE axis port=out_j_0
+#pragma HLS INTERFACE axis port=out_j_1
+#pragma HLS INTERFACE axis port=out_j_2
+#pragma HLS INTERFACE axis port=out_j_3
+#pragma HLS INTERFACE axis port=out_j_4
+#pragma HLS INTERFACE axis port=out_j_5
+#pragma HLS INTERFACE axis port=out_j_6
+#pragma HLS INTERFACE axis port=out_j_7
+#pragma HLS INTERFACE axis port=out_j_8
+#pragma HLS INTERFACE axis port=out_j_9
+#pragma HLS INTERFACE axis port=out_j_10
+#pragma HLS INTERFACE axis port=out_j_11
+#pragma HLS INTERFACE axis port=out_j_12
+#pragma HLS INTERFACE axis port=out_j_13
+#pragma HLS INTERFACE axis port=out_j_14
+#pragma HLS INTERFACE axis port=out_j_15
+#pragma HLS INTERFACE axis port=out_j_16
+#pragma HLS INTERFACE axis port=out_j_17
+#pragma HLS INTERFACE axis port=out_j_18
+#pragma HLS INTERFACE axis port=out_j_19
+#pragma HLS INTERFACE axis port=in_j_next_0
+#pragma HLS INTERFACE axis port=in_j_next_1
+#pragma HLS INTERFACE axis port=in_j_next_2
+#pragma HLS INTERFACE axis port=in_j_next_3
+#pragma HLS INTERFACE axis port=in_j_next_4
+#pragma HLS INTERFACE axis port=in_j_next_5
+#pragma HLS INTERFACE axis port=in_j_next_6
+#pragma HLS INTERFACE axis port=in_j_next_7
+#pragma HLS INTERFACE axis port=in_j_next_8
+#pragma HLS INTERFACE axis port=in_j_next_9
+#pragma HLS INTERFACE axis port=stat_to_q0
+#pragma HLS INTERFACE axis port=q0_from_ctrl
 #pragma HLS INTERFACE s_axilite port=image bundle=control
 #pragma HLS INTERFACE s_axilite port=output bundle=control
 #pragma HLS INTERFACE s_axilite port=iter_cnt bundle=control
+#pragma HLS INTERFACE s_axilite port=worker_id_arg bundle=control
 #pragma HLS INTERFACE s_axilite port=return bundle=control
 
-    int active_iters = iter_cnt;
-    if (active_iters < 1) {
-        active_iters = 1;
-    }
-    if (active_iters > srad_cfg::kSradIterations) {
-        active_iters = srad_cfg::kSradIterations;
-    }
+    const int worker_id = clamp_worker_id(worker_id_arg);
+    const int active_iters = active_iterations(iter_cnt);
+    write_debug_status(output, worker_id, 10.0f);
 
-    float q0sqr = compute_initial_q0sqr(image);
+    float sum = 0.0f;
+    float sum2 = 0.0f;
+    float group0_sum = 0.0f;
+    float group0_sum2 = 0.0f;
+    compute_initial_group_stats(image,
+                                worker_id,
+                                0 * srad_cfg::kWorkerGroupLanes,
+                                group0_sum,
+                                group0_sum2);
+    sum += group0_sum;
+    sum2 += group0_sum2;
+    float group1_sum = 0.0f;
+    float group1_sum2 = 0.0f;
+    compute_initial_group_stats(image,
+                                worker_id,
+                                1 * srad_cfg::kWorkerGroupLanes,
+                                group1_sum,
+                                group1_sum2);
+    sum += group1_sum;
+    sum2 += group1_sum2;
+    float group2_sum = 0.0f;
+    float group2_sum2 = 0.0f;
+    compute_initial_group_stats(image,
+                                worker_id,
+                                2 * srad_cfg::kWorkerGroupLanes,
+                                group2_sum,
+                                group2_sum2);
+    sum += group2_sum;
+    sum2 += group2_sum2;
+    float group3_sum = 0.0f;
+    float group3_sum2 = 0.0f;
+    compute_initial_group_stats(image,
+                                worker_id,
+                                3 * srad_cfg::kWorkerGroupLanes,
+                                group3_sum,
+                                group3_sum2);
+    sum += group3_sum;
+    sum2 += group3_sum2;
+    float group4_sum = 0.0f;
+    float group4_sum2 = 0.0f;
+    compute_initial_group_stats(image,
+                                worker_id,
+                                4 * srad_cfg::kWorkerGroupLanes,
+                                group4_sum,
+                                group4_sum2);
+    sum += group4_sum;
+    sum2 += group4_sum2;
+    write_debug_status(output, worker_id, 20.0f);
+    stat_to_q0.write(pack_two_floats(sum, sum2));
+    write_debug_status(output, worker_id, 30.0f);
 
     for (int iter = 0; iter < srad_cfg::kSradIterations; ++iter) {
         if (iter < active_iters) {
+            const float q0sqr = unpack_lane0(q0_from_ctrl.read());
+            write_debug_status(output,
+                               worker_id,
+                               40.0f + static_cast<float>(iter));
             float next_sum = 0.0f;
             float next_sum2 = 0.0f;
 
+            write_debug_status(output,
+                               worker_id,
+                               50.0f + static_cast<float>(iter));
             if ((iter & 1) == 0) {
-                run_one_iteration(image,
-                                  output,
-                                  out_j,
-                                  in_j_next,
-                                  q0sqr,
-                                  next_sum,
-                                  next_sum2);
+                run_worker_iteration_optimized(image,
+                                               output,
+                                               out_j_0,
+                                               out_j_1,
+                                               out_j_2,
+                                               out_j_3,
+                                               out_j_4,
+                                               out_j_5,
+                                               out_j_6,
+                                               out_j_7,
+                                               out_j_8,
+                                               out_j_9,
+                                               out_j_10,
+                                               out_j_11,
+                                               out_j_12,
+                                               out_j_13,
+                                               out_j_14,
+                                               out_j_15,
+                                               out_j_16,
+                                               out_j_17,
+                                               out_j_18,
+                                               out_j_19,
+                                               in_j_next_0,
+                                               in_j_next_1,
+                                               in_j_next_2,
+                                               in_j_next_3,
+                                               in_j_next_4,
+                                               in_j_next_5,
+                                               in_j_next_6,
+                                               in_j_next_7,
+                                               in_j_next_8,
+                                               in_j_next_9,
+                                               worker_id,
+                                               q0sqr,
+                                               next_sum,
+                                               next_sum2);
             } else {
-                run_one_iteration(output,
-                                  image,
-                                  out_j,
-                                  in_j_next,
-                                  q0sqr,
-                                  next_sum,
-                                  next_sum2);
+                run_worker_iteration_optimized(output,
+                                               image,
+                                               out_j_0,
+                                               out_j_1,
+                                               out_j_2,
+                                               out_j_3,
+                                               out_j_4,
+                                               out_j_5,
+                                               out_j_6,
+                                               out_j_7,
+                                               out_j_8,
+                                               out_j_9,
+                                               out_j_10,
+                                               out_j_11,
+                                               out_j_12,
+                                               out_j_13,
+                                               out_j_14,
+                                               out_j_15,
+                                               out_j_16,
+                                               out_j_17,
+                                               out_j_18,
+                                               out_j_19,
+                                               in_j_next_0,
+                                               in_j_next_1,
+                                               in_j_next_2,
+                                               in_j_next_3,
+                                               in_j_next_4,
+                                               in_j_next_5,
+                                               in_j_next_6,
+                                               in_j_next_7,
+                                               in_j_next_8,
+                                               in_j_next_9,
+                                               worker_id,
+                                               q0sqr,
+                                               next_sum,
+                                               next_sum2);
             }
+            write_debug_status(output,
+                               worker_id,
+                               60.0f + static_cast<float>(iter));
 
-            q0sqr = compute_q0sqr_from_sums(next_sum, next_sum2);
+            stat_to_q0.write(pack_two_floats(next_sum, next_sum2));
+            write_debug_status(output,
+                               worker_id,
+                               70.0f + static_cast<float>(iter));
         }
     }
 
     if ((active_iters & 1) == 0) {
-        copy_image(image, output);
+        write_debug_status(output, worker_id, 80.0f);
     }
+    write_debug_status(output, worker_id, 90.0f);
 }
 
 }
