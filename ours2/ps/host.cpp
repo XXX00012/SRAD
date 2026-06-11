@@ -38,7 +38,7 @@ namespace {
 
 constexpr int PREVIEW = 16;
 constexpr int PL_WORKERS = srad_cfg::kTopPlWorkers;
-constexpr int DIAG_POLL_MS = 1000;
+//constexpr int DIAG_POLL_MS = 1000;
 constexpr int TOPPL_DEBUG_BASE = srad_cfg::kOutputElems;
 constexpr int Q0_DEBUG_SLOTS = 8;
 constexpr int Q0_DEBUG_BASE = TOPPL_DEBUG_BASE + PL_WORKERS;

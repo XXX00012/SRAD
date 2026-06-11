@@ -537,6 +537,7 @@ int main(int argc, char* argv[]) {
             std::fflush(stdout);
             toppl_runs.emplace_back(toppl_kernels[i](input_bo,
                                                      output_bo,
+                                                     output_bo,
                                                      iter_cnt,
                                                      i));
             std::printf("[stage] TopPL_%d submit done\n", i);

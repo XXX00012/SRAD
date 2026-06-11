@@ -11,3 +11,4 @@ output_lanes_per_plio: 2
 aie_rows: 8
 aie_cols: 50
 kernels_per_lane: 2
+pl_freq_hz: 250000000

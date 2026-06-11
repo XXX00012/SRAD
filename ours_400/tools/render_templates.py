@@ -19,6 +19,15 @@ OUTPUTS = (
     ("conn.cfg.j2", "conn.cfg"),
 )
 
+UNSUPPORTED_HLS_PRAGMA_OPTIONS = (
+    "m_axi_alignment_byte_size",
+)
+
+TOPPL_REQUIRED_M_AXI_PRAGMAS = (
+    "#pragma HLS INTERFACE m_axi port=image offset=slave bundle=gmem0",
+    "#pragma HLS INTERFACE m_axi port=output offset=slave bundle=gmem1",
+)
+
 
 def to_attr(value: object) -> object:
     if isinstance(value, dict):
@@ -245,6 +254,16 @@ def read_design(path: Path) -> dict[str, object]:
     design["lanes"] = list(range(parallel_lanes))
     design["output_groups"] = list(range(output_plio_groups))
     design["plio_lane_ids"] = " ".join(str(lane) for lane in design["lanes"])
+
+    # Optional PL clock override. Set freq only on the kernel ap_clk pins so the
+    # platform NoC/datamover that serves the sp= memory ports keeps its own
+    # clock; a global --clock.defaultFreqHz reclocks those too and makes cfgen
+    # reject the sp= memory ports (CFGEN 83-2292 incorrect interface type).
+    if "pl_freq_hz" in design:
+        clock_cus = [f"TopPL_{w}.ap_clk" for w in design["workers"]]
+        clock_cus.append("Q0Ctrl_1.ap_clk")
+        design["pl_clock_targets"] = ",".join(clock_cus)
+
     design["worker_lane_pairs"] = [
         {
             "worker": worker,
@@ -264,6 +283,25 @@ def read_design(path: Path) -> dict[str, object]:
         for local_group in design["worker_output_groups_list"]
     ]
     return design
+
+
+def validate_rendered_output(output_name: str, text: str) -> None:
+    if output_name.endswith((".cpp", ".h")):
+        for option in UNSUPPORTED_HLS_PRAGMA_OPTIONS:
+            if option in text:
+                raise RuntimeError(
+                    f"{output_name} uses unsupported HLS pragma option: {option}"
+                )
+
+    if output_name != "pl/TopPL.cpp":
+        return
+
+    for pragma in TOPPL_REQUIRED_M_AXI_PRAGMAS:
+        if pragma not in text:
+            raise RuntimeError(
+                f"{output_name} is missing required m_axi interface pragma: "
+                f"{pragma}"
+            )
 
 
 def main() -> int:
@@ -291,6 +329,7 @@ def main() -> int:
     changed = []
     for template_name, output_name in OUTPUTS:
         rendered = env.get_template(template_name).render(**design)
+        validate_rendered_output(output_name, rendered)
         output_path = ROOT / output_name
         if args.check:
             current = output_path.read_text(encoding="utf-8")

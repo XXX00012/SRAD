@@ -85,6 +85,14 @@ endif
 VPP_XO_FLAGS := -c -t $(TARGET) --platform $(BASE_PLATFORM) --save-temps -g
 
 VPP_LINK_FLAGS := -l -t $(TARGET) --platform $(BASE_PLATFORM) $(GRAPH_O) $(KERNEL_XOS) --save-temps -g --config $(CONFIG_FILE) -o $(XSA)
+{% if pl_freq_hz %}
+# Lower the PL kernel clock to relax timing (ours_400 missed by ~34ps at the
+# platform-default ~312MHz). Target ONLY the kernel ap_clk pins; a global
+# --clock.defaultFreqHz also reclocks the platform datamover/NoC serving the
+# sp= memory ports and makes cfgen reject them (CFGEN 83-2292).
+PL_FREQ_HZ = {{ pl_freq_hz }}
+VPP_LINK_FLAGS += --clock.freqHz $(PL_FREQ_HZ):{{ pl_clock_targets }}
+{% endif %}
 VPP_LINK_FLAGS += --vivado.impl.jobs 256
 
 VPP_FLAGS := $(VPP_LINK_FLAGS)
@@ -115,9 +123,12 @@ LDCLFLAGS := $(GCC_LIB)
 .ONESHELL:
 .PHONY: clean all kernels aie sim xsa host package sd_card run run_emu data \
 	force_host \
+	fix_toppl_interfaces \
 	clear_aie clear_pl clear_ps clear_xsa clear_package clear_all
 
 all: aie kernels xsa host package sd_card
+fix_toppl_interfaces:
+	python -c 'from pathlib import Path; p=Path("$(PL_KERNEL_SRC)"); s=p.read_text(); old=s; bs=chr(92); ni="#pragma HLS INTERFACE m_axi port=image offset=slave bundle=gmem0"; oi="\n".join(["#pragma HLS INTERFACE m_axi port=image offset=slave bundle=gmem0 "+bs, "    max_widen_bitwidth=512 m_axi_alignment_byte_size=64 "+bs, "    max_read_burst_length=256 max_write_burst_length=256 "+bs, "    num_read_outstanding=32 num_write_outstanding=32"]); no="#pragma HLS INTERFACE m_axi port=output offset=slave bundle=gmem1"; oo="\n".join(["#pragma HLS INTERFACE m_axi port=output offset=slave bundle=gmem1 "+bs, "    max_widen_bitwidth=512 m_axi_alignment_byte_size=64 "+bs, "    max_read_burst_length=256 max_write_burst_length=256 "+bs, "    num_read_outstanding=32 num_write_outstanding=32"]); s=s.replace(oi, ni).replace(oi.replace("\n", "\r\n"), ni).replace(oo, no).replace(oo.replace("\n", "\r\n"), no); p.write_text(s) if s != old else None'
 sd_card: $(XCLBIN) $(HOST) $(RUN_SH) $(XRT_INI) $(DATA_FILES)
 	rm -rf $(SD_CARD_DIR)
 	mkdir -p $(SD_CARD_DIR)/data
@@ -143,7 +154,7 @@ aie: $(GRAPH_O)
 
 kernels: $(KERNEL_XOS)
 
-$(PL_KERNEL_XO): $(PL_KERNEL_SRC) ./aie/Config.h ./aie/ProcessUnit/include.h
+$(PL_KERNEL_XO): fix_toppl_interfaces $(PL_KERNEL_SRC) ./aie/Config.h ./aie/ProcessUnit/include.h
 	mkdir -p $(XO_DIR)
 	$(VPP) $(VPP_XO_FLAGS) -k $(PL_KERNEL) -o $(PL_KERNEL_XO) $(PL_KERNEL_SRC) | tee $(XO_DIR)/$(PL_KERNEL).log
 
