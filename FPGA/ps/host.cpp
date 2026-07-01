@@ -1,9 +1,8 @@
-// FPGA-v5-style SRAD AIE baseline:
-//   DDR -> PL transport shim -> one fused AIE kernel -> PL transport shim -> DDR
+// Board wrapper for the existing srad_fpga_v5 AIE kernel:
+//   DDR -> LoadFpgaV5 -> GraphFpgaV5(srad_fpga_v5) -> StoreFpgaV5 -> DDR.
 //
-// All PLIO-visible data is float32, matching Rodinia OpenCL SRAD's `fp float`.
-// Phase 1 computes q0sqr inside the AIE kernel. Phase 2 rereads J and fuses
-// coefficient generation with the update.
+// The AIE kernel computes q0sqr internally and emits sparse (index,value)
+// updates. PL only marshals DDR data into the stream order expected by AIE.
 
 #include "TopGraph.h"
 #include "ProcessUnit/include.h"
@@ -16,7 +15,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,51 +27,24 @@ GraphFpgaV5 graphFpgaV5("fpga_v5");
 
 namespace {
 
-constexpr int PREVIEW = 16;
+constexpr int kPreview = 16;
 constexpr float kCompareTol = 1.0e-5f;
+constexpr int kCpuReferenceMaxPixels = 1024 * 1024;
 using Clock = std::chrono::high_resolution_clock;
-
-struct PipelineTiming {
-    long long submit_us = 0;
-    long long wait_inputs_us = 0;
-    long long wait_output_us = 0;
-    long long wait_graph_us = 0;
-};
-
-struct CommonTiming {
-    long long data_transfer_us = 0;
-    long long logic_compute_us = 0;
-    long long end_to_end_us = 0;
-};
 
 struct ReferenceData {
     float q0sqr = 0.0f;
     std::vector<float> j_next;
 };
 
-long long elapsed_us(Clock::time_point start, Clock::time_point stop) {
-    return std::chrono::duration_cast<std::chrono::microseconds>(stop - start)
-        .count();
+void log_stage(const char* message) {
+    std::printf("[stage] %s\n", message);
+    std::fflush(stdout);
 }
 
-void print_wall_timing(const char* name, const PipelineTiming& timing) {
-    const long long total =
-        timing.submit_us + timing.wait_inputs_us +
-        timing.wait_output_us + timing.wait_graph_us;
-    std::printf("%s hw_emu wall timing us: submit=%lld wait_inputs=%lld wait_output=%lld wait_graph=%lld total=%lld\n",
-                name,
-                timing.submit_us,
-                timing.wait_inputs_us,
-                timing.wait_output_us,
-                timing.wait_graph_us,
-                total);
-}
-
-void print_common_timing(const char* name, const CommonTiming& timing) {
-    std::printf("---- Common timing summary (host wall us): %s ----\n", name);
-    std::printf("data_transfer_us: %lld\n", timing.data_transfer_us);
-    std::printf("logic_compute_us: %lld\n", timing.logic_compute_us);
-    std::printf("end_to_end_us   : %lld\n", timing.end_to_end_us);
+std::string default_input_path() {
+    return std::string("./data/input_") + std::to_string(ROW) + "x" +
+           std::to_string(COL) + ".txt";
 }
 
 bool load_float_file(const std::string& path, std::vector<float>& buf) {
@@ -83,29 +54,30 @@ bool load_float_file(const std::string& path, std::vector<float>& buf) {
         return false;
     }
 
-    for (int r = 0; r < ROW; ++r) {
-        for (int c = 0; c < COL; ++c) {
-            float v = 0.0f;
-            if (!(fin >> v)) {
+    for (int row = 0; row < ROW; ++row) {
+        for (int col = 0; col < COL; ++col) {
+            float value = 0.0f;
+            if (!(fin >> value)) {
                 std::fprintf(stderr,
                              "[warn] %s element count mismatch, expect %d values\n",
-                             path.c_str(), srad_cfg::kPixels);
+                             path.c_str(),
+                             srad_cfg::kPixels);
                 return false;
             }
-            buf[srad_math::image_index(r, c)] = v;
+            buf[srad_math::image_index(row, col)] = value;
         }
     }
     return true;
 }
 
 void fill_default_image(std::vector<float>& image) {
-    for (int r = 0; r < ROW; ++r) {
-        for (int c = 0; c < COL; ++c) {
-            image[srad_math::image_index(r, c)] =
-                1.0f + 0.003f * static_cast<float>(r) +
-                0.002f * static_cast<float>(c) +
-                0.05f * std::sin(0.31f * static_cast<float>(r)) *
-                    std::cos(0.19f * static_cast<float>(c));
+    for (int row = 0; row < ROW; ++row) {
+        for (int col = 0; col < COL; ++col) {
+            image[srad_math::image_index(row, col)] =
+                1.0f + 0.003f * static_cast<float>(row) +
+                0.002f * static_cast<float>(col) +
+                0.05f * std::sin(0.31f * static_cast<float>(row)) *
+                    std::cos(0.19f * static_cast<float>(col));
         }
     }
 }
@@ -117,10 +89,12 @@ void dump_float_file(const std::string& path, const std::vector<float>& buf) {
         return;
     }
 
-    for (int r = 0; r < ROW; ++r) {
-        for (int c = 0; c < COL; ++c) {
-            if (c) fout << ' ';
-            fout << buf[srad_math::image_index(r, c)];
+    for (int row = 0; row < ROW; ++row) {
+        for (int col = 0; col < COL; ++col) {
+            if (col) {
+                fout << ' ';
+            }
+            fout << buf[srad_math::image_index(row, col)];
         }
         fout << '\n';
     }
@@ -128,7 +102,7 @@ void dump_float_file(const std::string& path, const std::vector<float>& buf) {
 
 void print_preview(const char* tag, const std::vector<float>& buf) {
     std::printf("%s", tag);
-    const int n = std::min<int>(PREVIEW, buf.size());
+    const int n = std::min<int>(kPreview, buf.size());
     for (int i = 0; i < n; ++i) {
         std::printf(" %.9g", buf[i]);
     }
@@ -139,15 +113,15 @@ float compute_q0sqr_reference(const std::vector<float>& image) {
     float sum = 0.0f;
     float sum2 = 0.0f;
 
-    for (float v : image) {
-        sum += v;
-        sum2 += v * v;
+    for (float value : image) {
+        sum += value;
+        sum2 += value * value;
     }
 
     const float mean = sum / static_cast<float>(srad_cfg::kPixels);
     const float variance =
         (sum2 / static_cast<float>(srad_cfg::kPixels)) - (mean * mean);
-    return variance / (mean * mean);
+    return (mean != 0.0f) ? (variance / (mean * mean)) : 0.0f;
 }
 
 float compute_c_reference(float jc,
@@ -162,14 +136,12 @@ float compute_c_reference(float jc,
 
     const float g2 =
         (dN * dN + dS * dS + dW * dW + dE * dE) / (jc * jc);
-    const float l = (dN + dS + dW + dE) / jc;
-    const float num = 0.5f * g2 - (1.0f / 16.0f) * l * l;
-    float den = 1.0f + 0.25f * l;
+    const float lap = (dN + dS + dW + dE) / jc;
+    const float num = 0.5f * g2 - (1.0f / 16.0f) * lap * lap;
+    float den = 1.0f + 0.25f * lap;
     const float qsqr = num / (den * den);
     den = (qsqr - q0sqr) / (q0sqr * (1.0f + q0sqr));
-    const float c = 1.0f / (1.0f + den);
-
-    return srad_math::clamp01(c);
+    return srad_math::clamp01(1.0f / (1.0f + den));
 }
 
 ReferenceData cpu_reference(const std::vector<float>& image, float lambda) {
@@ -177,46 +149,39 @@ ReferenceData cpu_reference(const std::vector<float>& image, float lambda) {
     ref.q0sqr = compute_q0sqr_reference(image);
     ref.j_next.assign(srad_cfg::kPixels, 0.0f);
 
-    std::vector<float> c_plane(srad_cfg::kPixels, 0.0f);
+    std::vector<float> coeff(srad_cfg::kPixels, 0.0f);
 
-    for (int i = 0; i < ROW; ++i) {
-        for (int j = 0; j < COL; ++j) {
-            const int idx = srad_math::image_index(i, j);
-            const int iN = srad_math::north_row(i);
-            const int iS = srad_math::south_row(i);
-            const int jW = srad_math::west_col(j);
-            const int jE = srad_math::east_col(j);
-
-            const float JC = image[idx];
-            const float dN = image[srad_math::image_index(iN, j)] - JC;
-            const float dS = image[srad_math::image_index(iS, j)] - JC;
-            const float dW = image[srad_math::image_index(i, jW)] - JC;
-            const float dE = image[srad_math::image_index(i, jE)] - JC;
-
-            c_plane[idx] = compute_c_reference(JC, dN, dS, dW, dE, ref.q0sqr);
+    for (int row = 0; row < ROW; ++row) {
+        for (int col = 0; col < COL; ++col) {
+            const int p = srad_math::image_index(row, col);
+            const float jc = image[p];
+            const float dN =
+                image[srad_math::image_index(srad_math::north_row(row), col)] - jc;
+            const float dS =
+                image[srad_math::image_index(srad_math::south_row(row), col)] - jc;
+            const float dW =
+                image[srad_math::image_index(row, srad_math::west_col(col))] - jc;
+            const float dE =
+                image[srad_math::image_index(row, srad_math::east_col(col))] - jc;
+            coeff[p] = compute_c_reference(jc, dN, dS, dW, dE, ref.q0sqr);
         }
     }
 
-    for (int i = 0; i < ROW; ++i) {
-        for (int j = 0; j < COL; ++j) {
-            const int idx = srad_math::image_index(i, j);
-            const int iS = srad_math::south_row(i);
-            const int jE = srad_math::east_col(j);
-            const int south_idx = srad_math::image_index(iS, j);
-            const int east_idx = srad_math::image_index(i, jE);
-
-            const float JC = image[idx];
-            const float dN = image[srad_math::image_index(srad_math::north_row(i), j)] - JC;
-            const float dS = image[south_idx] - JC;
-            const float dW = image[srad_math::image_index(i, srad_math::west_col(j))] - JC;
-            const float dE = image[east_idx] - JC;
-
-            const float D =
-                c_plane[idx] * dN +
-                c_plane[south_idx] * dS +
-                c_plane[idx] * dW +
-                c_plane[east_idx] * dE;
-            ref.j_next[idx] = image[idx] + 0.25f * lambda * D;
+    for (int row = 0; row < ROW; ++row) {
+        for (int col = 0; col < COL; ++col) {
+            const int p = srad_math::image_index(row, col);
+            const int south = srad_math::image_index(srad_math::south_row(row), col);
+            const int east = srad_math::image_index(row, srad_math::east_col(col));
+            const float jc = image[p];
+            const float dN =
+                image[srad_math::image_index(srad_math::north_row(row), col)] - jc;
+            const float dS = image[south] - jc;
+            const float dW =
+                image[srad_math::image_index(row, srad_math::west_col(col))] - jc;
+            const float dE = image[east] - jc;
+            const float d =
+                coeff[p] * dN + coeff[south] * dS + coeff[p] * dW + coeff[east] * dE;
+            ref.j_next[p] = jc + 0.25f * lambda * d;
         }
     }
 
@@ -234,7 +199,9 @@ void compare_output(const std::vector<float>& got,
         const float denom = std::max(std::fabs(gold[i]), 1.0e-12f);
         max_abs = std::max(max_abs, abs_err);
         max_rel = std::max(max_rel, abs_err / denom);
-        if (abs_err > kCompareTol) ++mismatch_count;
+        if (abs_err > kCompareTol) {
+            ++mismatch_count;
+        }
     }
 
     std::printf("max_abs_error_float : %.9g\n", max_abs);
@@ -265,111 +232,195 @@ int main(int argc, char* argv[]) {
     }
 
     const std::string xclbin_path = argv[1];
-    const int iter_cnt = (argc >= 3) ? std::atoi(argv[2]) : srad_cfg::kDefaultIterations;
-    const std::string input_path = (argc >= 4) ? argv[3] : "./data/input_32x32.txt";
-    const std::string output_path = (argc >= 5) ? argv[4] : "./data/aie_j_next.txt";
+    const int iter_cnt =
+        (argc >= 3) ? std::atoi(argv[2]) : srad_cfg::kDefaultIterations;
+    const std::string input_path =
+        (argc >= 4) ? argv[3] : default_input_path();
+    const std::string output_path =
+        (argc >= 5) ? argv[4] : "./data/aie_j_next.txt";
     const float lambda = (argc >= 6) ? static_cast<float>(std::atof(argv[5]))
                                      : srad_cfg::kLambdaDefault;
 
-    if (iter_cnt != 1) {
+    if (iter_cnt <= 0) {
         std::fprintf(stderr,
-                     "[error] this FPGA-v5-style baseline supports one iteration; got %d\n",
+                     "[error] iteration count must be positive; got %d\n",
                      iter_cnt);
         return EXIT_FAILURE;
     }
 
-    std::vector<float> image(srad_cfg::kPixels);
+    std::vector<float> image(srad_cfg::kPixels, 0.0f);
     if (!load_float_file(input_path, image)) {
         std::fprintf(stderr, "[warn] fallback to deterministic input\n");
         fill_default_image(image);
     }
 
-    const ReferenceData ref = cpu_reference(image, lambda);
+    const bool run_reference =
+        (iter_cnt == 1) && (srad_cfg::kPixels <= kCpuReferenceMaxPixels);
+    ReferenceData ref;
+    if (run_reference) {
+        ref = cpu_reference(image, lambda);
+    }
 
-    std::printf("image size            : %dx%d (%d pixels)\n", ROW, COL, srad_cfg::kPixels);
-    std::printf("float lanes per packet: %d\n", srad_cfg::kLanes);
-    std::printf("q0sqr_ref float32     : %.9g\n", ref.q0sqr);
+    std::printf("image size            : %dx%d (%d pixels)\n",
+                ROW,
+                COL,
+                srad_cfg::kPixels);
+    std::printf("iterations requested  : %d\n", iter_cnt);
+    std::printf("tile geometry         : %dx%d tiles, input tile %dx%d\n",
+                srad_cfg::kTileRows,
+                srad_cfg::kTileCols,
+                srad_cfg::kInputTileRows,
+                srad_cfg::kInputTileCols);
+    std::printf("tiles per iteration   : %d\n",
+                srad_cfg::kTilesPerIteration);
+    std::printf("compute stream floats : %d\n",
+                srad_cfg::kComputeStreamElems);
+    std::printf("output stream floats  : %d\n",
+                srad_cfg::kOutputStreamElems);
+    if (run_reference) {
+        std::printf("q0sqr_ref float32     : %.9g\n", ref.q0sqr);
+    } else {
+        std::printf("reference compare     : skipped");
+        if (iter_cnt != 1) {
+            std::printf(" (multi-iteration run)");
+        } else {
+            std::printf(" (image exceeds %d pixels)", kCpuReferenceMaxPixels);
+        }
+        std::printf("\n");
+    }
     std::printf("lambda float32        : %.9g\n", lambda);
-    std::printf("q0sqr_aie             : internal to fused kernel, no baseline output port\n");
     print_preview("input preview:", image);
 
-    auto device = xrt::device(0);
-    auto xrt_uuid = device.load_xclbin(xclbin_path);
+    bool graph_needs_end = false;
+    bool graph_end_attempted = false;
 
-    auto dhdl = xrtDeviceOpen(0);
-    if (!dhdl) {
-        std::fprintf(stderr, "[error] xrtDeviceOpen failed\n");
-        return EXIT_FAILURE;
-    }
+    try {
+        log_stage("open XRT device 0");
+        auto device = xrt::device(0);
 
-    if (xrtDeviceLoadXclbinFile(dhdl, xclbin_path.c_str())) {
-        std::fprintf(stderr, "[error] xrtDeviceLoadXclbinFile failed\n");
+        log_stage("load xclbin");
+        auto xrt_uuid = device.load_xclbin(xclbin_path);
+
+        log_stage("open XRT C handle from loaded xclbin");
+        xrtDeviceHandle dhdl = xrtDeviceOpenFromXcl(device);
+        if (!dhdl) {
+            std::fprintf(stderr, "[error] xrtDeviceOpenFromXcl failed\n");
+            return EXIT_FAILURE;
+        }
+
+        log_stage("register ADF graph with XRT");
+        adf::registerXRT(dhdl, xrt_uuid.get());
+
+        log_stage("open PL kernels");
+        auto load_fpga = open_kernel_or_die(device, xrt_uuid, "LoadFpgaV5");
+        auto store_fpga = open_kernel_or_die(device, xrt_uuid, "StoreFpgaV5");
+
+        log_stage("allocate BOs");
+        auto image_bo =
+            xrt::bo(device, srad_cfg::kImageBytes, load_fpga.group_id(0));
+        auto output_bo =
+            xrt::bo(device, srad_cfg::kOutputBytes, store_fpga.group_id(2));
+
+        log_stage("map BOs");
+        auto image_map = image_bo.map<float*>();
+        auto output_map = output_bo.map<float*>();
+
+        log_stage("prepare BO contents");
+        std::memcpy(image_map, image.data(), srad_cfg::kImageBytes);
+        std::memset(output_map, 0, srad_cfg::kOutputBytes);
+
+        log_stage("sync input BO to device");
+        image_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        log_stage("graph init");
+        graphFpgaV5.init();
+        graph_needs_end = true;
+
+        long long pl_us = 0;
+        const auto pipeline_t0 = Clock::now();
+        for (int iter = 0; iter < iter_cnt; ++iter) {
+            const int iter_id = iter + 1;
+            std::printf("[stage] iteration %d/%d run PL/AIE transaction\n",
+                        iter_id,
+                        iter_cnt);
+            std::fflush(stdout);
+
+            const auto iter_pl_t0 = Clock::now();
+            auto sink_run = store_fpga(nullptr, nullptr, output_bo);
+            graphFpgaV5.run(1);
+            auto source_run = load_fpga(image_bo, lambda, nullptr, nullptr);
+            source_run.wait();
+            sink_run.wait();
+            const auto iter_pl_t1 = Clock::now();
+            pl_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                         iter_pl_t1 - iter_pl_t0)
+                         .count();
+
+            std::printf("[stage] iteration %d/%d wait graph\n",
+                        iter_id,
+                        iter_cnt);
+            std::fflush(stdout);
+            graphFpgaV5.wait();
+
+            log_stage("sync output BO from device");
+            output_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            if (iter + 1 < iter_cnt) {
+                log_stage("prepare next iteration input");
+                std::memcpy(image_map, output_map, srad_cfg::kImageBytes);
+                image_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            }
+        }
+        const auto pipeline_t1 = Clock::now();
+        const auto pipeline_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                pipeline_t1 - pipeline_t0)
+                .count();
+
+        log_stage("graph end");
+        graph_end_attempted = true;
+        graphFpgaV5.end();
+        graph_needs_end = false;
+
+        log_stage("process output");
+        std::vector<float> got(output_map,
+                               output_map + srad_cfg::kOutputElems);
+        print_preview("output preview:", got);
+        if (run_reference) {
+            compare_output(got, ref.j_next);
+        } else {
+            std::printf("reference compare     : skipped\n");
+        }
+        dump_float_file(output_path, got);
+
+        std::printf("pl_total_us : %lld\n", static_cast<long long>(pl_us));
+        std::printf("pipeline_total_us : %lld\n",
+                    static_cast<long long>(pipeline_us));
+
+        log_stage("close XRT device");
         xrtDeviceClose(dhdl);
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "[error] XRT/AIE execution failed: %s\n", ex.what());
+        std::fflush(stderr);
+        if (graph_needs_end && !graph_end_attempted) {
+            try {
+                std::fprintf(stderr, "[cleanup] graph end after exception\n");
+                std::fflush(stderr);
+                graph_end_attempted = true;
+                graphFpgaV5.end();
+                graph_needs_end = false;
+            } catch (const std::exception& cleanup_ex) {
+                std::fprintf(stderr,
+                             "[cleanup] graph end failed after exception: %s\n",
+                             cleanup_ex.what());
+                std::fflush(stderr);
+            } catch (...) {
+                std::fprintf(stderr,
+                             "[cleanup] graph end failed after exception\n");
+                std::fflush(stderr);
+            }
+        }
         return EXIT_FAILURE;
     }
-
-    xuid_t uuid;
-    xrtDeviceGetXclbinUUID(dhdl, uuid);
-    adf::registerXRT(dhdl, uuid);
-
-    auto load_fpga = open_kernel_or_die(device, xrt_uuid, "LoadFpgaV5");
-    auto store_fpga = open_kernel_or_die(device, xrt_uuid, "StoreFpgaV5");
-
-    auto image_bo = xrt::bo(device, srad_cfg::kImageBytes, load_fpga.group_id(0));
-    auto out_bo = xrt::bo(device, srad_cfg::kImageBytes, store_fpga.group_id(0));
-
-    auto image_map = image_bo.map<float*>();
-    auto out_map = out_bo.map<float*>();
-
-    std::memcpy(image_map, image.data(), srad_cfg::kImageBytes);
-    std::memset(out_map, 0, srad_cfg::kImageBytes);
-    image_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    out_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-    PipelineTiming timing;
-    const auto t0 = Clock::now();
-
-    std::printf("---- LoadFpgaV5 + GraphFpgaV5 + StoreFpgaV5: DDR -> PL -> AIE -> PL -> DDR ----\n");
-    graphFpgaV5.init();
-
-    auto stage_t0 = Clock::now();
-    auto sink_run = store_fpga(out_bo);
-    graphFpgaV5.run(1);
-    auto source_run = load_fpga(image_bo, lambda);
-    source_run.wait();
-    timing.wait_inputs_us = elapsed_us(stage_t0, Clock::now());
-
-    stage_t0 = Clock::now();
-    graphFpgaV5.wait();
-    timing.wait_graph_us = elapsed_us(stage_t0, Clock::now());
-
-    stage_t0 = Clock::now();
-    sink_run.wait();
-    timing.wait_output_us = elapsed_us(stage_t0, Clock::now());
-
-    graphFpgaV5.end();
-
-    const auto t1 = Clock::now();
-    const auto dur_us = elapsed_us(t0, t1);
-
-    out_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    std::vector<float> got(out_map, out_map + srad_cfg::kPixels);
-    print_preview("output preview:", got);
-    compare_output(got, ref.j_next);
-    print_wall_timing("GraphFpgaV5", timing);
-    std::printf("fused graph hw_emu wall time: %lld us\n",
-                static_cast<long long>(dur_us));
-
-    CommonTiming common;
-    common.data_transfer_us =
-        timing.wait_inputs_us + timing.wait_output_us;
-    common.logic_compute_us = timing.wait_graph_us;
-    common.end_to_end_us = dur_us;
-    print_common_timing("FPGA", common);
-
-    dump_float_file(output_path, got);
-
-    (void)dhdl;
 
     return EXIT_SUCCESS;
 }

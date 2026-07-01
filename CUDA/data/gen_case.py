@@ -1,307 +1,411 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
+import argparse
 import math
 import re
-import struct
 from pathlib import Path
 
-def read_config():
-    cfg = Path(__file__).resolve().parents[1] / "aie" / "Config.h"
-    text = cfg.read_text(encoding="utf-8")
-    values = []
-    for name in ("kRows", "kCols", "kLanes", "kBlockRows", "kBlockCols"):
-        match = re.search(rf"constexpr\s+int\s+{name}\s*=\s*(\d+)\s*;", text)
-        if match is None:
-            raise RuntimeError(f"cannot read {name} from {cfg}")
-        values.append(int(match.group(1)))
-    return tuple(values)
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "aie" / "Config.h"
 
 
-ROWS, COLS, LANES, BLOCK_ROWS, BLOCK_COLS = read_config()
-PIXELS = ROWS * COLS
-LAMBDA = 0.5
-OPENCL_REDUCTION_THREADS = 256
-TILE_ROWS = (ROWS + BLOCK_ROWS - 1) // BLOCK_ROWS
-TILE_COLS = (COLS + BLOCK_COLS - 1) // BLOCK_COLS
-TILE_COUNT = TILE_ROWS * TILE_COLS
-COEFF_INPUT_ROWS = ROWS
-COEFF_INPUT_COLS = COLS
-UPDATE_C_INPUT_ROWS = ROWS
-UPDATE_C_INPUT_COLS = COLS
-UPDATE_C_INPUT_ELEMS = PIXELS
+def read_config_text() -> str:
+    return CONFIG_PATH.read_text(encoding="utf-8")
 
 
-def f32(v: float) -> float:
-    return struct.unpack("f", struct.pack("f", float(v)))[0]
+def read_config_ints(text: str) -> dict[str, int]:
+    values: dict[str, int] = {}
+    pending: dict[str, str] = {}
 
-
-def north_row(r: int) -> int:
-    return 0 if r == 0 else r - 1
-
-
-def south_row(r: int) -> int:
-    return ROWS - 1 if r == ROWS - 1 else r + 1
-
-
-def west_col(c: int) -> int:
-    return 0 if c == 0 else c - 1
-
-
-def east_col(c: int) -> int:
-    return COLS - 1 if c == COLS - 1 else c + 1
-
-
-def idx(r: int, c: int) -> int:
-    return r + ROWS * c
-
-
-def clamp_index(v: int, lo: int, hi: int) -> int:
-    return max(lo, min(v, hi))
-
-
-def clamp01(v: float) -> float:
-    return f32(max(0.0, min(1.0, v)))
-
-
-def ceil_div(x: int, y: int) -> int:
-    return (x + y - 1) // y
-
-
-def largest_opencl_reduction_pow2(n: int) -> int:
-    df = 1
-    i = 2
-    while i <= OPENCL_REDUCTION_THREADS:
-        if n >= i:
-            df = i
-        i *= 2
-    return df
-
-
-def reduce_full_opencl_block(psum, psum2):
-    i = 2
-    while i <= OPENCL_REDUCTION_THREADS:
-        for tx in range(i - 1, OPENCL_REDUCTION_THREADS, i):
-            psum[tx] = f32(psum[tx] + psum[tx - i // 2])
-            psum2[tx] = f32(psum2[tx] + psum2[tx - i // 2])
-        i *= 2
-
-
-def opencl_v0_reduce_stats(image):
-    sums = [0.0] * PIXELS
-    sums2 = [0.0] * PIXELS
-    for opencl_idx, value in enumerate(image):
-        v = f32(value)
-        sums[opencl_idx] = v
-        sums2[opencl_idx] = f32(v * v)
-
-    no = PIXELS
-    mul = 1
-    grid_dim = ceil_div(no, OPENCL_REDUCTION_THREADS)
-
-    while grid_dim != 0:
-        nf = OPENCL_REDUCTION_THREADS - (
-            grid_dim * OPENCL_REDUCTION_THREADS - no
-        )
-        for bx in range(grid_dim):
-            psum = [0.0] * OPENCL_REDUCTION_THREADS
-            psum2 = [0.0] * OPENCL_REDUCTION_THREADS
-            for tx in range(OPENCL_REDUCTION_THREADS):
-                ei = bx * OPENCL_REDUCTION_THREADS + tx
-                if ei < no:
-                    src = ei * mul
-                    psum[tx] = sums[src]
-                    psum2[tx] = sums2[src]
-
-            dst = bx * mul * OPENCL_REDUCTION_THREADS
-            if nf == OPENCL_REDUCTION_THREADS or bx != grid_dim - 1:
-                reduce_full_opencl_block(psum, psum2)
-                sums[dst] = psum[OPENCL_REDUCTION_THREADS - 1]
-                sums2[dst] = psum2[OPENCL_REDUCTION_THREADS - 1]
-            else:
-                df = largest_opencl_reduction_pow2(nf)
-                i = 2
-                while i <= df:
-                    for tx in range(i - 1, df, i):
-                        psum[tx] = f32(psum[tx] + psum[tx - i // 2])
-                        psum2[tx] = f32(psum2[tx] + psum2[tx - i // 2])
-                    i *= 2
-
-                tx = df - 1
-                for i in range(
-                    bx * OPENCL_REDUCTION_THREADS + df,
-                    bx * OPENCL_REDUCTION_THREADS + nf,
-                ):
-                    psum[tx] = f32(psum[tx] + sums[i])
-                    psum2[tx] = f32(psum2[tx] + sums2[i])
-                sums[dst] = psum[tx]
-                sums2[dst] = psum2[tx]
-
-        no = grid_dim
-        if grid_dim == 1:
-            grid_dim = 0
+    for name, expr in re.findall(r"constexpr\s+int\s+(\w+)\s*=\s*([^;]+)\s*;", text):
+        expr = expr.strip()
+        if re.fullmatch(r"\d+", expr):
+            values[name] = int(expr)
         else:
-            mul *= OPENCL_REDUCTION_THREADS
-            grid_dim = ceil_div(no, OPENCL_REDUCTION_THREADS)
+            pending[name] = expr
 
-    return sums[0], sums2[0]
+    changed = True
+    while changed:
+        changed = False
+        for name, expr in list(pending.items()):
+            expr_py = expr.replace("sizeof(float)", "4").replace("/", "//")
+            if not re.fullmatch(r"[\w\s+\-*/()%]+", expr_py):
+                continue
+            try:
+                value = eval(expr_py, {"__builtins__": {}}, values)
+            except NameError:
+                continue
+            if isinstance(value, float):
+                if not value.is_integer():
+                    continue
+                value = int(value)
+            if isinstance(value, int):
+                values[name] = value
+                del pending[name]
+                changed = True
 
-
-def compute_q0sqr(image):
-    sum_j, sum2_j = opencl_v0_reduce_stats(image)
-    mean = f32(sum_j / f32(PIXELS))
-    mean2 = f32(mean * mean)
-    variance = f32(f32(sum2_j / f32(PIXELS)) - mean2)
-    return f32(variance / mean2)
-
-
-def compute_c(jc, d_n, d_s, d_w, d_e, q0sqr):
-    g2_sum = f32(f32(f32(d_n * d_n) + f32(d_s * d_s)) + f32(d_w * d_w))
-    g2_sum = f32(g2_sum + f32(d_e * d_e))
-    g2 = f32(g2_sum / f32(jc * jc))
-    lap = f32(f32(f32(f32(d_n + d_s) + d_w) + d_e) / jc)
-    num = f32(f32(0.5 * g2) - f32(f32(1.0 / 16.0) * f32(lap * lap)))
-    den = f32(1.0 + f32(0.25 * lap))
-    qsqr = f32(num / f32(den * den))
-    den = f32(f32(qsqr - q0sqr) / f32(q0sqr * f32(1.0 + q0sqr)))
-    c = f32(1.0 / f32(1.0 + den))
-    return clamp01(c)
+    return values
 
 
-def srad_one_iteration(image, q0sqr, lam):
-    c_plane = [0.0] * PIXELS
-    dn_plane = [0.0] * PIXELS
-    ds_plane = [0.0] * PIXELS
-    dw_plane = [0.0] * PIXELS
-    de_plane = [0.0] * PIXELS
-
-    for r in range(ROWS):
-        for c in range(COLS):
-            p = idx(r, c)
-            jc = f32(image[p])
-            d_n = f32(image[idx(north_row(r), c)] - jc)
-            d_s = f32(image[idx(south_row(r), c)] - jc)
-            d_w = f32(image[idx(r, west_col(c))] - jc)
-            d_e = f32(image[idx(r, east_col(c))] - jc)
-            dn_plane[p] = d_n
-            ds_plane[p] = d_s
-            dw_plane[p] = d_w
-            de_plane[p] = d_e
-            c_plane[p] = compute_c(jc, d_n, d_s, d_w, d_e, q0sqr)
-
-    out = [0.0] * PIXELS
-    for r in range(ROWS):
-        for c in range(COLS):
-            p = idx(r, c)
-            d_val = f32(c_plane[p] * dn_plane[p])
-            d_val = f32(d_val + f32(c_plane[idx(south_row(r), c)] * ds_plane[p]))
-            d_val = f32(d_val + f32(c_plane[p] * dw_plane[p]))
-            d_val = f32(d_val + f32(c_plane[idx(r, east_col(c))] * de_plane[p]))
-            out[p] = f32(image[p] + f32(f32(0.25 * lam) * d_val))
-
-    return out, c_plane, dn_plane, ds_plane, dw_plane, de_plane
+def pick_int(values: dict[str, int], *names: str, default: int | None = None) -> int:
+    for name in names:
+        if name in values:
+            return values[name]
+    if default is not None:
+        return default
+    raise RuntimeError(f"cannot read {', '.join(names)} from {CONFIG_PATH}")
 
 
-def write_matrix(path: Path, data):
-    with path.open("w", encoding="utf-8") as f:
-        for r in range(ROWS):
-            row = [data[idx(r, c)] for c in range(COLS)]
-            f.write(" ".join(f"{v:.9g}" for v in row))
-            f.write("\n")
+def parse_lambda(text: str) -> float:
+    lam_match = re.search(
+        r"constexpr\s+float\s+kLambdaDefault\s*=\s*([0-9eE+\-.]+)f?\s*;",
+        text,
+    )
+    return float(lam_match.group(1)) if lam_match else 0.5
 
 
-def write_stream(path: Path, data):
-    with path.open("w", encoding="utf-8") as f:
-        for v in data:
-            f.write(f"{v:.9g}\n")
+def read_board_config(text: str | None = None) -> tuple[dict[str, int], float]:
+    if text is None:
+        text = read_config_text()
+    values = read_config_ints(text)
+    rows = pick_int(values, "kBoardRows", "kRows")
+    cols = pick_int(values, "kBoardCols", "kCols")
+    pixels = values.get("kBoardPixels", values.get("kPixels", rows * cols))
+    cfg = {
+        "kBoardRows": rows,
+        "kBoardCols": cols,
+        "kBoardPixels": pixels,
+    }
+    return cfg, parse_lambda(text)
 
 
-def pack_coeff_image_stream(image):
-    out = []
-    for _ in range(TILE_COUNT):
-        out.extend(image)
-    return out
+def read_config() -> tuple[dict[str, int], float]:
+    text = read_config_text()
+    values = read_config_ints(text)
+    board_cfg, lambda_default = read_board_config(text)
+    required = (
+        "kCudaBlockElems",
+        "kMetaPacketElems",
+        "kReducePacketElems",
+        "kCoeffInputElems",
+        "kUpdateInputElems",
+    )
+    missing = [name for name in required if name not in values]
+    if missing:
+        raise RuntimeError(f"cannot read {', '.join(missing)} from {CONFIG_PATH}")
+
+    cfg = dict(values)
+    cfg.update(board_cfg)
+    return cfg, lambda_default
 
 
-def pack_plain_tile_stream(image):
-    out = []
-    for tr in range(TILE_ROWS):
-        for tc in range(TILE_COLS):
-            row0 = tr * BLOCK_ROWS
-            col0 = tc * BLOCK_COLS
-            for c in range(BLOCK_COLS):
-                for r in range(BLOCK_ROWS):
-                    gr = clamp_index(row0 + r, 0, ROWS - 1)
-                    gc = clamp_index(col0 + c, 0, COLS - 1)
-                    out.append(image[idx(gr, gc)])
-    return out
+CFG: dict[str, int] = {}
+LAMBDA_DEFAULT = 0.5
+ROWS = 0
+COLS = 0
+PIXELS = 0
+BLOCK = 0
+META = 0
 
 
-def pack_update_c_stream(c_plane):
-    out = []
-    for _ in range(TILE_COUNT):
-        out.extend(c_plane)
-    return out
+def apply_runtime_config(cfg: dict[str, int], lambda_default: float) -> None:
+    global CFG, LAMBDA_DEFAULT, ROWS, COLS, PIXELS, BLOCK, META
+    CFG = cfg
+    LAMBDA_DEFAULT = lambda_default
+    ROWS = cfg["kBoardRows"]
+    COLS = cfg["kBoardCols"]
+    PIXELS = cfg["kBoardPixels"]
+    BLOCK = cfg.get("kCudaBlockElems", 0)
+    META = cfg.get("kMetaPacketElems", 0)
 
 
-def scalar_packet_stream(value):
-    out = []
-    for _ in range(TILE_COUNT):
-        out.append(f32(value))
-        out.extend([0.0] * (LANES - 1))
-    return out
+GRAPH_INPUT_FILES = (
+    "gpu_prepare_i.txt",
+    "gpu_reduce_packet.txt",
+    "gpu_srad_neighbors.txt",
+    "gpu_srad_q0.txt",
+    "gpu_srad2_update.txt",
+    "gpu_srad2_meta.txt",
+)
+
+GRAPH_OUTPUT_FILES = (
+    "gpu_prepare_sums.txt",
+    "gpu_prepare_sums2.txt",
+    "gpu_reduce_partial.txt",
+    "gpu_srad_dN.txt",
+    "gpu_srad_dS.txt",
+    "gpu_srad_dW.txt",
+    "gpu_srad_dE.txt",
+    "gpu_srad_c.txt",
+    "gpu_srad2_i_next.txt",
+)
+
+STALE_FILES = (
+    "aie_j_next.txt",
+    "aiesim_j_next.txt",
+    "aiesimoutput.txt",
+    "gold_srad_rowstream.txt",
+    "input_image_sim.txt",
+    "plio_ours_j.txt",
+    "plio_ours_j_next.txt",
+    "plio_ours_j_tile.txt",
+    "q0sqr.txt",
+    "q0sqr_ref.txt",
+)
 
 
-def main():
+def default_pixel(row: int, col: int) -> float:
+    return (
+        1.0
+        + 0.003 * row
+        + 0.002 * col
+        + 0.05 * math.sin(0.31 * row) * math.cos(0.19 * col)
+    )
+
+
+def pixel_at_linear(index: int) -> float:
+    return default_pixel(index // COLS, index % COLS)
+
+
+def sample_image(index: int, row_delta: int = 0, col_delta: int = 0) -> float:
+    row = index // COLS + row_delta
+    col = index % COLS + col_delta
+    if row < 0 or row >= ROWS or col < 0 or col >= COLS:
+        return 0.0
+    return default_pixel(row, col)
+
+
+def write_matrix(path: Path, rows: int, cols: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fout:
+        for row in range(rows):
+            values = (f"{default_pixel(row, col):.9g}" for col in range(cols))
+            fout.write(" ".join(values) + "\n")
+
+
+def write_plio64_stream(path: Path, values: list[float]) -> None:
+    if len(values) % 2 != 0:
+        raise ValueError(f"{path} requires an even float count for plio_64_bits")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fout:
+        for i in range(0, len(values), 2):
+            fout.write(f"{values[i]:.9g} {values[i + 1]:.9g}\n")
+
+
+def compute_q0sqr(values: list[float]) -> float:
+    mean = sum(values) / len(values)
+    variance = (sum(v * v for v in values) / len(values)) - (mean * mean)
+    return variance / (mean * mean) if mean != 0.0 else 0.0
+
+
+def clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def coeff_from_neighbors(jc: float,
+                         jn: float,
+                         js: float,
+                         jw: float,
+                         je: float,
+                         q0sqr: float) -> tuple[float, float, float, float, float]:
+    d_n = jn - jc
+    d_s = js - jc
+    d_w = jw - jc
+    d_e = je - jc
+    if jc == 0.0 or q0sqr == 0.0:
+        return d_n, d_s, d_w, d_e, 1.0
+
+    g2 = ((d_n * d_n) + (d_s * d_s) + (d_w * d_w) + (d_e * d_e)) / (jc * jc)
+    lap = (d_n + d_s + d_w + d_e) / jc
+    num = (0.5 * g2) - ((1.0 / 16.0) * lap * lap)
+    den0 = 1.0 + (0.25 * lap)
+    qsqr = num / (den0 * den0)
+    den1 = (qsqr - q0sqr) / (q0sqr * (1.0 + q0sqr))
+    return d_n, d_s, d_w, d_e, clamp01(1.0 / (1.0 + den1))
+
+
+def coeff_at(index: int, q0sqr: float) -> tuple[float, float, float, float, float]:
+    return coeff_from_neighbors(
+        sample_image(index),
+        sample_image(index, row_delta=-1),
+        sample_image(index, row_delta=1),
+        sample_image(index, col_delta=-1),
+        sample_image(index, col_delta=1),
+        q0sqr,
+    )
+
+
+def make_prepare_input(block_index: int = 0) -> list[float]:
+    base = block_index * BLOCK
+    return [pixel_at_linear(base + i) for i in range(BLOCK)]
+
+
+def make_reduce_packet(sums: list[float], sums2: list[float]) -> list[float]:
+    packet = [0.0] * META
+    packet[0] = float(len(sums))
+    for sum_value, sum2_value in zip(sums, sums2):
+        packet.append(sum_value)
+        packet.append(sum2_value)
+    return packet
+
+
+def make_neighbors(block_index: int, q0sqr: float) -> tuple[list[float], dict[str, list[float]]]:
+    base = block_index * BLOCK
+    planes = {
+        "jc": [],
+        "jn": [],
+        "js": [],
+        "jw": [],
+        "je": [],
+        "dN": [],
+        "dS": [],
+        "dW": [],
+        "dE": [],
+        "c": [],
+    }
+
+    for i in range(BLOCK):
+        index = base + i
+        jc = sample_image(index)
+        jn = sample_image(index, row_delta=-1)
+        js = sample_image(index, row_delta=1)
+        jw = sample_image(index, col_delta=-1)
+        je = sample_image(index, col_delta=1)
+        d_n, d_s, d_w, d_e, coeff = coeff_from_neighbors(jc, jn, js, jw, je, q0sqr)
+        planes["jc"].append(jc)
+        planes["jn"].append(jn)
+        planes["js"].append(js)
+        planes["jw"].append(jw)
+        planes["je"].append(je)
+        planes["dN"].append(d_n)
+        planes["dS"].append(d_s)
+        planes["dW"].append(d_w)
+        planes["dE"].append(d_e)
+        planes["c"].append(coeff)
+
+    neighbors = planes["jc"] + planes["jn"] + planes["js"] + planes["jw"] + planes["je"]
+    return neighbors, planes
+
+
+def make_update_input(block_index: int,
+                      q0sqr: float,
+                      planes: dict[str, list[float]]) -> tuple[list[float], list[float]]:
+    base = block_index * BLOCK
+    image = [sample_image(base + i) for i in range(BLOCK)]
+    c_s: list[float] = []
+    c_e: list[float] = []
+    for i in range(BLOCK):
+        index = base + i
+        row = index // COLS
+        col = index % COLS
+        c_s.append(coeff_at(index + COLS, q0sqr)[4] if row + 1 < ROWS else 0.0)
+        c_e.append(coeff_at(index + 1, q0sqr)[4] if col + 1 < COLS else 0.0)
+
+    update = (
+        image
+        + planes["dN"]
+        + planes["dS"]
+        + planes["dW"]
+        + planes["dE"]
+        + planes["c"]
+        + c_s
+        + c_e
+    )
+
+    expected: list[float] = []
+    scale = 0.25 * LAMBDA_DEFAULT
+    for i, value in enumerate(image):
+        divergence = (
+            planes["c"][i] * planes["dN"][i]
+            + c_s[i] * planes["dS"][i]
+            + planes["c"][i] * planes["dW"][i]
+            + c_e[i] * planes["dE"][i]
+        )
+        expected.append(value + scale * divergence)
+
+    return update, expected
+
+
+def cleanup(base: Path) -> None:
+    for name in STALE_FILES + GRAPH_OUTPUT_FILES:
+        path = base / name
+        if path.exists():
+            try:
+                path.unlink()
+            except PermissionError:
+                pass
+
+
+def generate_board_input(base: Path, verbose: bool) -> None:
+    write_matrix(base / "input_image.txt", ROWS, COLS)
+    if verbose:
+        print(f"generated board input {ROWS}x{COLS} ({PIXELS} floats)")
+
+
+def generate_sim_inputs(base: Path, verbose: bool) -> None:
+    cleanup(base)
+    block_index = 0
+    prepare_i = make_prepare_input(block_index)
+    sums = prepare_i[:]
+    sums2 = [value * value for value in prepare_i]
+    q0sqr = compute_q0sqr(prepare_i)
+    reduce_packet = make_reduce_packet(sums, sums2)
+    neighbors, coeff_planes = make_neighbors(block_index, q0sqr)
+    update_packet, update_expected = make_update_input(block_index, q0sqr, coeff_planes)
+
+    write_plio64_stream(base / "gpu_prepare_i.txt", prepare_i)
+    write_plio64_stream(base / "gpu_reduce_packet.txt", reduce_packet)
+    write_plio64_stream(base / "gpu_srad_neighbors.txt", neighbors)
+    write_plio64_stream(base / "gpu_srad_q0.txt", [q0sqr] + [0.0] * (META - 1))
+    write_plio64_stream(base / "gpu_srad2_update.txt", update_packet)
+    write_plio64_stream(
+        base / "gpu_srad2_meta.txt",
+        [LAMBDA_DEFAULT] + [0.0] * (META - 1),
+    )
+
+    # Golden files are for the Python verifier only; AIE writes the gpu_* output names.
+    write_plio64_stream(base / "gold_gpu_prepare_sums.txt", sums)
+    write_plio64_stream(base / "gold_gpu_prepare_sums2.txt", sums2)
+    write_plio64_stream(base / "gold_gpu_reduce_partial.txt", [sum(sums), sum(sums2)])
+    write_plio64_stream(base / "gold_gpu_srad_dN.txt", coeff_planes["dN"])
+    write_plio64_stream(base / "gold_gpu_srad_dS.txt", coeff_planes["dS"])
+    write_plio64_stream(base / "gold_gpu_srad_dW.txt", coeff_planes["dW"])
+    write_plio64_stream(base / "gold_gpu_srad_dE.txt", coeff_planes["dE"])
+    write_plio64_stream(base / "gold_gpu_srad_c.txt", coeff_planes["c"])
+    write_plio64_stream(base / "gold_gpu_srad2_i_next.txt", update_expected)
+
+    if verbose:
+        print(f"generated one-block AIE CUDA-style sim case, block={BLOCK}")
+        print(f"q0sqr={q0sqr:.9g}, lambda={LAMBDA_DEFAULT:.9g}")
+        print(f"reduce packet floats={len(reduce_packet)}")
+        print(f"coeff input floats={len(neighbors)}")
+        print(f"update input floats={len(update_packet)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate SRAD CUDA-style AIE data.")
+    parser.add_argument(
+        "--sim",
+        action="store_true",
+        help="generate the one-block PLIO files used by x86/aie simulation",
+    )
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
     base = Path(__file__).resolve().parent
-    image = [0.0] * PIXELS
-    for r in range(ROWS):
-        for c in range(COLS):
-            v = (
-                1.0
-                + 0.003 * r
-                + 0.002 * c
-                + 0.05 * math.sin(0.31 * r) * math.cos(0.19 * c)
-            )
-            image[idx(r, c)] = f32(v)
+    if args.sim:
+        cfg, lambda_default = read_config()
+    else:
+        cfg, lambda_default = read_board_config()
+    apply_runtime_config(cfg, lambda_default)
 
-    q0sqr = compute_q0sqr(image)
-    sums_plane = list(image)
-    sums2_plane = [f32(v * v) for v in image]
-    golden, c_plane, dn_plane, ds_plane, dw_plane, de_plane = srad_one_iteration(
-        image, q0sqr, LAMBDA
-    )
-
-    write_matrix(base / "input_32x32.txt", image)
-    write_matrix(base / "golden_32x32.txt", golden)
-    write_matrix(base / "ref_d_sums.txt", sums_plane)
-    write_matrix(base / "ref_d_sums2.txt", sums2_plane)
-    write_matrix(base / "ref_d_c.txt", c_plane)
-    write_matrix(base / "ref_d_dN.txt", dn_plane)
-    write_matrix(base / "ref_d_dS.txt", ds_plane)
-    write_matrix(base / "ref_d_dW.txt", dw_plane)
-    write_matrix(base / "ref_d_dE.txt", de_plane)
-
-    write_stream(base / "plio_prepare_j.txt", image)
-    write_stream(base / "plio_prepare_sums.txt", sums_plane)
-    write_stream(base / "plio_prepare_sums2.txt", sums2_plane)
-    write_stream(base / "plio_coeff_j.txt", pack_coeff_image_stream(image))
-    write_stream(base / "plio_update_j.txt", pack_plain_tile_stream(image))
-    write_stream(base / "plio_runtime_coeff_q0sqr.txt", scalar_packet_stream(q0sqr))
-    write_stream(base / "plio_runtime_update_c.txt", pack_update_c_stream(c_plane))
-    write_stream(base / "plio_runtime_update_dN.txt", pack_plain_tile_stream(dn_plane))
-    write_stream(base / "plio_runtime_update_dS.txt", pack_plain_tile_stream(ds_plane))
-    write_stream(base / "plio_runtime_update_dW.txt", pack_plain_tile_stream(dw_plane))
-    write_stream(base / "plio_runtime_update_dE.txt", pack_plain_tile_stream(de_plane))
-    write_stream(base / "plio_runtime_lambda.txt", scalar_packet_stream(LAMBDA))
-
-    (base / "q0sqr_ref.txt").write_text(
-        "\n".join(f"{q0sqr:.9g}" for _ in range(8)) + "\n",
-        encoding="utf-8",
-    )
-    (base / "lambda.txt").write_text(f"{LAMBDA:.9g}\n", encoding="utf-8")
-    print(f"generated {ROWS}x{COLS} OpenCL-v0-layout SRAD case")
-    print(f"q0sqr={q0sqr:.9g} lambda={LAMBDA:.9g}")
+    if args.sim:
+        generate_sim_inputs(base, args.verbose)
+    else:
+        generate_board_input(base, args.verbose)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,0 +1,4 @@
+interface:
+  display_name: "SRAD AIE Debug Workflow"
+  short_description: "Manual-backed SRAD debug workflow"
+  default_prompt: "Use $srad-aie-debug-workflow to analyze an SRAD AIE issue with focused subagents and targeted manual lookup."

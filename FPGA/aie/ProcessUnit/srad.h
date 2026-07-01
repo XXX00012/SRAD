@@ -5,24 +5,14 @@
 
 using namespace adf;
 
-using srad_image_input_buffer = input_buffer<
-    float,
-    adf::extents<adf::inherited_extent>>;
-
-using srad_scalar_input_buffer = input_buffer<
-    float,
-    adf::extents<adf::inherited_extent>>;
-
-using srad_image_output_buffer = output_buffer<
-    float,
-    adf::extents<adf::inherited_extent>>;
+using srad_float_input_stream = input_stream<float>;
+using srad_float_output_stream = output_stream<float>;
 
 extern "C" {
 
-void srad_fpga_v5_fused(
-    srad_image_input_buffer& in_reduce,
-    srad_image_input_buffer& in_compute,
-    srad_scalar_input_buffer& in_lambda,
-    srad_image_output_buffer& out_j_next);
+void srad_fpga_v5(srad_float_input_stream* in_params,
+                  srad_float_input_stream* in_compute,
+                  srad_float_output_stream* out_index,
+                  srad_float_output_stream* out_value);
 
 }

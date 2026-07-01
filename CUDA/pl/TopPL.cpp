@@ -1,78 +1,112 @@
 #include "../aie/Config.h"
 
+#include <ap_int.h>
 #include <hls_stream.h>
+#include <cstdint>
 
 namespace {
 
-int clamp_index(int v, int lo, int hi) {
-    return (v < lo) ? lo : ((v > hi) ? hi : v);
+using plio_word_t = ap_uint<64>;
+
+static_assert(srad_cfg::kCudaBlockElems % 2 == 0,
+              "64-bit PLIO packing requires an even block element count");
+static_assert(srad_cfg::kMetaPacketElems % 2 == 0,
+              "64-bit PLIO packing requires an even metadata packet length");
+
+ap_uint<32> float_to_bits(float value) {
+    union {
+        float f;
+        uint32_t u;
+    } conv;
+    conv.f = value;
+    return ap_uint<32>(conv.u);
 }
 
-int valid_tile_rows(int row0) {
-    const int remain = srad_cfg::kRows - row0;
-    return (remain < srad_cfg::kBlockRows) ? remain : srad_cfg::kBlockRows;
+float bits_to_float(ap_uint<32> bits) {
+    union {
+        float f;
+        uint32_t u;
+    } conv;
+    conv.u = static_cast<uint32_t>(bits);
+    return conv.f;
 }
 
-int valid_tile_cols(int col0) {
-    const int remain = srad_cfg::kCols - col0;
-    return (remain < srad_cfg::kBlockCols) ? remain : srad_cfg::kBlockCols;
+plio_word_t pack_two_floats(float lane0, float lane1) {
+    plio_word_t word = 0;
+    word.range(31, 0) = float_to_bits(lane0);
+    word.range(63, 32) = float_to_bits(lane1);
+    return word;
 }
 
-int opencl_index(int row, int col) {
-    return row + srad_cfg::kRows * col;
+float unpack_lane0(plio_word_t word) {
+    return bits_to_float(word.range(31, 0));
 }
 
-void stream_plain_tile(const float* image,
-                       hls::stream<float>& out,
-                       int row0,
-                       int col0,
-                       bool zero_outside) {
-    const int rows = valid_tile_rows(row0);
-    const int cols = valid_tile_cols(col0);
+float unpack_lane1(plio_word_t word) {
+    return bits_to_float(word.range(63, 32));
+}
 
-    for (int c = 0; c < srad_cfg::kBlockCols; ++c) {
-        for (int r = 0; r < srad_cfg::kBlockRows; ++r) {
-#pragma HLS PIPELINE II=1
-            float v = 0.0f;
-            if (!zero_outside || (r < rows && c < cols)) {
-                const int gr = clamp_index(row0 + r, 0, srad_cfg::kRows - 1);
-                const int gc = clamp_index(col0 + c, 0, srad_cfg::kCols - 1);
-                v = image[opencl_index(gr, gc)];
-            }
-            out.write(v);
-        }
+int active_blocks(int block_count) {
+#pragma HLS INLINE
+    int blocks = block_count;
+    if (blocks < 1) {
+        blocks = 1;
     }
-}
-
-void stream_full_image(const float* image, hls::stream<float>& out) {
-    for (int i = 0; i < srad_cfg::kPixels; ++i) {
-#pragma HLS PIPELINE II=1
-        out.write(image[i]);
+    if (blocks > srad_cfg::kCudaBlocks) {
+        blocks = srad_cfg::kCudaBlocks;
     }
+    return blocks;
 }
 
-void store_plain_tile(hls::stream<float>& in,
-                      float* image,
-                      int row0,
-                      int col0) {
-    const int rows = valid_tile_rows(row0);
-    const int cols = valid_tile_cols(col0);
-
-    for (int c = 0; c < srad_cfg::kBlockCols; ++c) {
-        for (int r = 0; r < srad_cfg::kBlockRows; ++r) {
-#pragma HLS PIPELINE II=1
-            const float v = in.read();
-            if (r < rows && c < cols) {
-                image[opencl_index(row0 + r, col0 + c)] = v;
-            }
-        }
+int valid_count_for_block(int block) {
+#pragma HLS INLINE
+    const int base = block * srad_cfg::kCudaBlockElems;
+    int remaining = srad_cfg::kBoardPixels - base;
+    if (remaining < 0) {
+        remaining = 0;
     }
+    if (remaining > srad_cfg::kCudaBlockElems) {
+        remaining = srad_cfg::kCudaBlockElems;
+    }
+    return remaining;
 }
 
-void stream_q0_packet(const float* q0_packet, hls::stream<float>& out) {
-    for (int i = 0; i < srad_cfg::kScalarPacketElems; ++i) {
+float image_value_or_zero(const float* image, int linear_index) {
+#pragma HLS INLINE
+    if (linear_index < 0 || linear_index >= srad_cfg::kBoardPixels) {
+        return 0.0f;
+    }
+    return image[linear_index];
+}
+
+float neighbor_value_or_zero(const float* image, int linear_index, int row_delta, int col_delta) {
+#pragma HLS INLINE
+    const int row = (linear_index / srad_cfg::kBoardCols) + row_delta;
+    const int col = (linear_index % srad_cfg::kBoardCols) + col_delta;
+    if (row < 0 || row >= srad_cfg::kBoardRows ||
+        col < 0 || col >= srad_cfg::kBoardCols) {
+        return 0.0f;
+    }
+    return image[row * srad_cfg::kBoardCols + col];
+}
+
+float coeff_neighbor_or_zero(const float* coeff, int linear_index, int row_delta, int col_delta) {
+#pragma HLS INLINE
+    const int row = (linear_index / srad_cfg::kBoardCols) + row_delta;
+    const int col = (linear_index % srad_cfg::kBoardCols) + col_delta;
+    if (row < 0 || row >= srad_cfg::kBoardRows ||
+        col < 0 || col >= srad_cfg::kBoardCols) {
+        return 0.0f;
+    }
+    return coeff[row * srad_cfg::kBoardCols + col];
+}
+
+void write_meta_packet(float first_value, hls::stream<plio_word_t>& out) {
+#pragma HLS INLINE off
+    out.write(pack_two_floats(first_value, 0.0f));
+    for (int word = 1; word < (srad_cfg::kMetaPacketElems / 2); ++word) {
 #pragma HLS PIPELINE II=1
-        out.write(q0_packet[i]);
+        out.write(pack_two_floats(0.0f, 0.0f));
     }
 }
 
@@ -80,214 +114,276 @@ void stream_q0_packet(const float* q0_packet, hls::stream<float>& out) {
 
 extern "C" {
 
-void LoadPrepare(const float* image,
-                 hls::stream<float>& out_j) {
+void PreparePL(const float* image,
+               float* sums,
+               float* sums2,
+               int block_count,
+               hls::stream<plio_word_t>& out_i,
+               hls::stream<plio_word_t>& in_sums,
+               hls::stream<plio_word_t>& in_sums2) {
 #pragma HLS INTERFACE m_axi port=image offset=slave bundle=gmem0
-#pragma HLS INTERFACE axis port=out_j
+#pragma HLS INTERFACE m_axi port=sums offset=slave bundle=gmem1
+#pragma HLS INTERFACE m_axi port=sums2 offset=slave bundle=gmem2
 #pragma HLS INTERFACE s_axilite port=image bundle=control
-#pragma HLS INTERFACE s_axilite port=return bundle=control
-
-    stream_full_image(image, out_j);
-}
-
-void StorePrepare(hls::stream<float>& in_sums,
-                  hls::stream<float>& in_sums2,
-                  float* sums,
-                  float* sums2) {
+#pragma HLS INTERFACE s_axilite port=sums bundle=control
+#pragma HLS INTERFACE s_axilite port=sums2 bundle=control
+#pragma HLS INTERFACE s_axilite port=block_count bundle=control
+#pragma HLS INTERFACE axis port=out_i
 #pragma HLS INTERFACE axis port=in_sums
 #pragma HLS INTERFACE axis port=in_sums2
-#pragma HLS INTERFACE m_axi port=sums offset=slave bundle=gmem0
-#pragma HLS INTERFACE m_axi port=sums2 offset=slave bundle=gmem1
-#pragma HLS INTERFACE s_axilite port=sums bundle=control
-#pragma HLS INTERFACE s_axilite port=sums2 bundle=control
 #pragma HLS INTERFACE s_axilite port=return bundle=control
 
-    for (int i = 0; i < srad_cfg::kPixels; ++i) {
+    const int blocks = active_blocks(block_count);
+    for (int block = 0; block < blocks; ++block) {
+        const int base = block * srad_cfg::kCudaBlockElems;
+
+        for (int word = 0; word < srad_cfg::kCudaBlockElems / 2; ++word) {
 #pragma HLS PIPELINE II=1
-        sums[i] = in_sums.read();
-        sums2[i] = in_sums2.read();
-    }
-}
+            const int idx0 = base + (2 * word);
+            const int idx1 = idx0 + 1;
+            out_i.write(pack_two_floats(
+                image_value_or_zero(image, idx0),
+                image_value_or_zero(image, idx1)));
+        }
 
-void LoadReduce(const float* sums,
-                const float* sums2,
-                hls::stream<float>& out_sums,
-                hls::stream<float>& out_sums2) {
-#pragma HLS INTERFACE m_axi port=sums offset=slave bundle=gmem0
-#pragma HLS INTERFACE m_axi port=sums2 offset=slave bundle=gmem1
-#pragma HLS INTERFACE axis port=out_sums
-#pragma HLS INTERFACE axis port=out_sums2
-#pragma HLS INTERFACE s_axilite port=sums bundle=control
-#pragma HLS INTERFACE s_axilite port=sums2 bundle=control
-#pragma HLS INTERFACE s_axilite port=return bundle=control
-
-    for (int i = 0; i < srad_cfg::kPixels; ++i) {
+        for (int word = 0; word < srad_cfg::kCudaBlockElems / 2; ++word) {
 #pragma HLS PIPELINE II=1
-        out_sums.write(sums[i]);
-        out_sums2.write(sums2[i]);
-    }
-}
-
-void StoreReduce(hls::stream<float>& in_stats,
-                 float* stats) {
-#pragma HLS INTERFACE axis port=in_stats
-#pragma HLS INTERFACE m_axi port=stats offset=slave bundle=gmem0
-#pragma HLS INTERFACE s_axilite port=stats bundle=control
-#pragma HLS INTERFACE s_axilite port=return bundle=control
-
-    for (int i = 0; i < srad_cfg::kScalarPacketElems; ++i) {
-#pragma HLS PIPELINE II=1
-        stats[i] = in_stats.read();
-    }
-}
-
-void LoadCoeff(const float* image,
-               float q0sqr,
-               hls::stream<float>& out_j,
-               hls::stream<float>& out_q0sqr) {
-#pragma HLS INTERFACE m_axi port=image offset=slave bundle=gmem0
-#pragma HLS INTERFACE axis port=out_j
-#pragma HLS INTERFACE axis port=out_q0sqr
-#pragma HLS INTERFACE s_axilite port=image bundle=control
-#pragma HLS INTERFACE s_axilite port=q0sqr bundle=control
-#pragma HLS INTERFACE s_axilite port=return bundle=control
-
-    float q0_packet[srad_cfg::kScalarPacketElems];
-#pragma HLS ARRAY_PARTITION variable=q0_packet complete dim=1
-    for (int i = 0; i < srad_cfg::kScalarPacketElems; ++i) {
-#pragma HLS PIPELINE II=1
-        q0_packet[i] = (i == 0) ? q0sqr : 0.0f;
-    }
-
-    for (int tr = 0; tr < srad_cfg::kTileRows; ++tr) {
-        for (int tc = 0; tc < srad_cfg::kTileCols; ++tc) {
-            stream_q0_packet(q0_packet, out_q0sqr);
-            stream_full_image(image, out_j);
+            const plio_word_t sum_word = in_sums.read();
+            const plio_word_t sum2_word = in_sums2.read();
+            const int idx0 = base + (2 * word);
+            const int idx1 = idx0 + 1;
+            if (idx0 < srad_cfg::kBoardPixels) {
+                sums[idx0] = unpack_lane0(sum_word);
+                sums2[idx0] = unpack_lane0(sum2_word);
+            }
+            if (idx1 < srad_cfg::kBoardPixels) {
+                sums[idx1] = unpack_lane1(sum_word);
+                sums2[idx1] = unpack_lane1(sum2_word);
+            }
         }
     }
 }
 
-void StoreCoeff(hls::stream<float>& in_c,
-                hls::stream<float>& in_dN,
-                hls::stream<float>& in_dS,
-                hls::stream<float>& in_dW,
-                hls::stream<float>& in_dE,
-                float* c_plane,
-                float* dN_plane,
-                float* dS_plane,
-                float* dW_plane,
-                float* dE_plane) {
-#pragma HLS INTERFACE axis port=in_c
+void ReducePL(const float* sums,
+              const float* sums2,
+              float* partials,
+              int block_count,
+              hls::stream<plio_word_t>& out_packet,
+              hls::stream<plio_word_t>& in_partial) {
+#pragma HLS INTERFACE m_axi port=sums offset=slave bundle=gmem0
+#pragma HLS INTERFACE m_axi port=sums2 offset=slave bundle=gmem1
+#pragma HLS INTERFACE m_axi port=partials offset=slave bundle=gmem2
+#pragma HLS INTERFACE s_axilite port=sums bundle=control
+#pragma HLS INTERFACE s_axilite port=sums2 bundle=control
+#pragma HLS INTERFACE s_axilite port=partials bundle=control
+#pragma HLS INTERFACE s_axilite port=block_count bundle=control
+#pragma HLS INTERFACE axis port=out_packet
+#pragma HLS INTERFACE axis port=in_partial
+#pragma HLS INTERFACE s_axilite port=return bundle=control
+
+    const int blocks = active_blocks(block_count);
+    for (int block = 0; block < blocks; ++block) {
+        const int base = block * srad_cfg::kCudaBlockElems;
+        write_meta_packet(static_cast<float>(valid_count_for_block(block)), out_packet);
+
+        for (int tx = 0; tx < srad_cfg::kCudaBlockElems; ++tx) {
+#pragma HLS PIPELINE II=1
+            const int idx = base + tx;
+            const float sum_value =
+                (idx < srad_cfg::kBoardPixels) ? sums[idx] : 0.0f;
+            const float sum2_value =
+                (idx < srad_cfg::kBoardPixels) ? sums2[idx] : 0.0f;
+            out_packet.write(pack_two_floats(sum_value, sum2_value));
+        }
+
+        const plio_word_t partial_word = in_partial.read();
+        partials[(2 * block) + 0] = unpack_lane0(partial_word);
+        partials[(2 * block) + 1] = unpack_lane1(partial_word);
+    }
+}
+
+void CoeffPL(const float* image,
+             float* dN,
+             float* dS,
+             float* dW,
+             float* dE,
+             float* coeff,
+             float q0sqr,
+             int block_count,
+             hls::stream<plio_word_t>& out_neighbors,
+             hls::stream<plio_word_t>& out_q0,
+             hls::stream<plio_word_t>& in_dN,
+             hls::stream<plio_word_t>& in_dS,
+             hls::stream<plio_word_t>& in_dW,
+             hls::stream<plio_word_t>& in_dE,
+             hls::stream<plio_word_t>& in_c) {
+#pragma HLS INTERFACE m_axi port=image offset=slave bundle=gmem0
+#pragma HLS INTERFACE m_axi port=dN offset=slave bundle=gmem1
+#pragma HLS INTERFACE m_axi port=dS offset=slave bundle=gmem2
+#pragma HLS INTERFACE m_axi port=dW offset=slave bundle=gmem3
+#pragma HLS INTERFACE m_axi port=dE offset=slave bundle=gmem4
+#pragma HLS INTERFACE m_axi port=coeff offset=slave bundle=gmem5
+#pragma HLS INTERFACE s_axilite port=image bundle=control
+#pragma HLS INTERFACE s_axilite port=dN bundle=control
+#pragma HLS INTERFACE s_axilite port=dS bundle=control
+#pragma HLS INTERFACE s_axilite port=dW bundle=control
+#pragma HLS INTERFACE s_axilite port=dE bundle=control
+#pragma HLS INTERFACE s_axilite port=coeff bundle=control
+#pragma HLS INTERFACE s_axilite port=q0sqr bundle=control
+#pragma HLS INTERFACE s_axilite port=block_count bundle=control
+#pragma HLS INTERFACE axis port=out_neighbors
+#pragma HLS INTERFACE axis port=out_q0
 #pragma HLS INTERFACE axis port=in_dN
 #pragma HLS INTERFACE axis port=in_dS
 #pragma HLS INTERFACE axis port=in_dW
 #pragma HLS INTERFACE axis port=in_dE
-#pragma HLS INTERFACE m_axi port=c_plane offset=slave bundle=gmem0
-#pragma HLS INTERFACE m_axi port=dN_plane offset=slave bundle=gmem1
-#pragma HLS INTERFACE m_axi port=dS_plane offset=slave bundle=gmem2
-#pragma HLS INTERFACE m_axi port=dW_plane offset=slave bundle=gmem3
-#pragma HLS INTERFACE m_axi port=dE_plane offset=slave bundle=gmem4
-#pragma HLS INTERFACE s_axilite port=c_plane bundle=control
-#pragma HLS INTERFACE s_axilite port=dN_plane bundle=control
-#pragma HLS INTERFACE s_axilite port=dS_plane bundle=control
-#pragma HLS INTERFACE s_axilite port=dW_plane bundle=control
-#pragma HLS INTERFACE s_axilite port=dE_plane bundle=control
+#pragma HLS INTERFACE axis port=in_c
 #pragma HLS INTERFACE s_axilite port=return bundle=control
 
-    for (int tr = 0; tr < srad_cfg::kTileRows; ++tr) {
-        for (int tc = 0; tc < srad_cfg::kTileCols; ++tc) {
-            const int row0 = tr * srad_cfg::kBlockRows;
-            const int col0 = tc * srad_cfg::kBlockCols;
-            const int rows = valid_tile_rows(row0);
-            const int cols = valid_tile_cols(col0);
-            for (int c = 0; c < srad_cfg::kBlockCols; ++c) {
-                for (int r = 0; r < srad_cfg::kBlockRows; ++r) {
+    const int blocks = active_blocks(block_count);
+    for (int block = 0; block < blocks; ++block) {
+        const int base = block * srad_cfg::kCudaBlockElems;
+
+        for (int plane = 0; plane < srad_cfg::kCoeffInputPlanes; ++plane) {
+            for (int word = 0; word < srad_cfg::kCudaBlockElems / 2; ++word) {
 #pragma HLS PIPELINE II=1
-                    const float cv = in_c.read();
-                    const float dNv = in_dN.read();
-                    const float dSv = in_dS.read();
-                    const float dWv = in_dW.read();
-                    const float dEv = in_dE.read();
-                    if (r < rows && c < cols) {
-                        const int idx = opencl_index(row0 + r, col0 + c);
-                        c_plane[idx] = cv;
-                        dN_plane[idx] = dNv;
-                        dS_plane[idx] = dSv;
-                        dW_plane[idx] = dWv;
-                        dE_plane[idx] = dEv;
-                    }
+                const int idx0 = base + (2 * word);
+                const int idx1 = idx0 + 1;
+                float lane0 = 0.0f;
+                float lane1 = 0.0f;
+                if (plane == 0) {
+                    lane0 = image_value_or_zero(image, idx0);
+                    lane1 = image_value_or_zero(image, idx1);
+                } else if (plane == 1) {
+                    lane0 = neighbor_value_or_zero(image, idx0, -1, 0);
+                    lane1 = neighbor_value_or_zero(image, idx1, -1, 0);
+                } else if (plane == 2) {
+                    lane0 = neighbor_value_or_zero(image, idx0, 1, 0);
+                    lane1 = neighbor_value_or_zero(image, idx1, 1, 0);
+                } else if (plane == 3) {
+                    lane0 = neighbor_value_or_zero(image, idx0, 0, -1);
+                    lane1 = neighbor_value_or_zero(image, idx1, 0, -1);
+                } else {
+                    lane0 = neighbor_value_or_zero(image, idx0, 0, 1);
+                    lane1 = neighbor_value_or_zero(image, idx1, 0, 1);
                 }
+                out_neighbors.write(pack_two_floats(lane0, lane1));
             }
         }
-    }
-}
+        write_meta_packet(q0sqr, out_q0);
 
-void LoadUpdate(const float* image,
-                const float* c_plane,
-                const float* dN_plane,
-                const float* dS_plane,
-                const float* dW_plane,
-                const float* dE_plane,
-                float lambda,
-                hls::stream<float>& out_j,
-                hls::stream<float>& out_c,
-                hls::stream<float>& out_dN,
-                hls::stream<float>& out_dS,
-                hls::stream<float>& out_dW,
-                hls::stream<float>& out_dE,
-                hls::stream<float>& out_lambda) {
-#pragma HLS INTERFACE m_axi port=image offset=slave bundle=gmem0
-#pragma HLS INTERFACE m_axi port=c_plane offset=slave bundle=gmem1
-#pragma HLS INTERFACE m_axi port=dN_plane offset=slave bundle=gmem2
-#pragma HLS INTERFACE m_axi port=dS_plane offset=slave bundle=gmem3
-#pragma HLS INTERFACE m_axi port=dW_plane offset=slave bundle=gmem4
-#pragma HLS INTERFACE m_axi port=dE_plane offset=slave bundle=gmem5
-#pragma HLS INTERFACE axis port=out_j
-#pragma HLS INTERFACE axis port=out_c
-#pragma HLS INTERFACE axis port=out_dN
-#pragma HLS INTERFACE axis port=out_dS
-#pragma HLS INTERFACE axis port=out_dW
-#pragma HLS INTERFACE axis port=out_dE
-#pragma HLS INTERFACE axis port=out_lambda
-#pragma HLS INTERFACE s_axilite port=image bundle=control
-#pragma HLS INTERFACE s_axilite port=c_plane bundle=control
-#pragma HLS INTERFACE s_axilite port=dN_plane bundle=control
-#pragma HLS INTERFACE s_axilite port=dS_plane bundle=control
-#pragma HLS INTERFACE s_axilite port=dW_plane bundle=control
-#pragma HLS INTERFACE s_axilite port=dE_plane bundle=control
-#pragma HLS INTERFACE s_axilite port=lambda bundle=control
-#pragma HLS INTERFACE s_axilite port=return bundle=control
-
-    for (int tr = 0; tr < srad_cfg::kTileRows; ++tr) {
-        for (int tc = 0; tc < srad_cfg::kTileCols; ++tc) {
-            const int row0 = tr * srad_cfg::kBlockRows;
-            const int col0 = tc * srad_cfg::kBlockCols;
-            for (int i = 0; i < srad_cfg::kScalarPacketElems; ++i) {
+        for (int word = 0; word < srad_cfg::kCudaBlockElems / 2; ++word) {
 #pragma HLS PIPELINE II=1
-                out_lambda.write((i == 0) ? lambda : 0.0f);
+            const plio_word_t dN_word = in_dN.read();
+            const plio_word_t dS_word = in_dS.read();
+            const plio_word_t dW_word = in_dW.read();
+            const plio_word_t dE_word = in_dE.read();
+            const plio_word_t c_word = in_c.read();
+            const int idx0 = base + (2 * word);
+            const int idx1 = idx0 + 1;
+            if (idx0 < srad_cfg::kBoardPixels) {
+                dN[idx0] = unpack_lane0(dN_word);
+                dS[idx0] = unpack_lane0(dS_word);
+                dW[idx0] = unpack_lane0(dW_word);
+                dE[idx0] = unpack_lane0(dE_word);
+                coeff[idx0] = unpack_lane0(c_word);
             }
-            stream_plain_tile(image, out_j, row0, col0, false);
-            stream_full_image(c_plane, out_c);
-            stream_plain_tile(dN_plane, out_dN, row0, col0, false);
-            stream_plain_tile(dS_plane, out_dS, row0, col0, false);
-            stream_plain_tile(dW_plane, out_dW, row0, col0, false);
-            stream_plain_tile(dE_plane, out_dE, row0, col0, false);
+            if (idx1 < srad_cfg::kBoardPixels) {
+                dN[idx1] = unpack_lane1(dN_word);
+                dS[idx1] = unpack_lane1(dS_word);
+                dW[idx1] = unpack_lane1(dW_word);
+                dE[idx1] = unpack_lane1(dE_word);
+                coeff[idx1] = unpack_lane1(c_word);
+            }
         }
     }
 }
 
-void StoreUpdate(hls::stream<float>& in_j_next,
-                 float* output) {
-#pragma HLS INTERFACE axis port=in_j_next
-#pragma HLS INTERFACE m_axi port=output offset=slave bundle=gmem0
+void UpdatePL(const float* image,
+              const float* dN,
+              const float* dS,
+              const float* dW,
+              const float* dE,
+              const float* coeff,
+              float* output,
+              float lambda_value,
+              int block_count,
+              hls::stream<plio_word_t>& out_update,
+              hls::stream<plio_word_t>& out_meta,
+              hls::stream<plio_word_t>& in_i_next) {
+#pragma HLS INTERFACE m_axi port=image offset=slave bundle=gmem0
+#pragma HLS INTERFACE m_axi port=dN offset=slave bundle=gmem1
+#pragma HLS INTERFACE m_axi port=dS offset=slave bundle=gmem2
+#pragma HLS INTERFACE m_axi port=dW offset=slave bundle=gmem3
+#pragma HLS INTERFACE m_axi port=dE offset=slave bundle=gmem4
+#pragma HLS INTERFACE m_axi port=coeff offset=slave bundle=gmem5
+#pragma HLS INTERFACE m_axi port=output offset=slave bundle=gmem6
+#pragma HLS INTERFACE s_axilite port=image bundle=control
+#pragma HLS INTERFACE s_axilite port=dN bundle=control
+#pragma HLS INTERFACE s_axilite port=dS bundle=control
+#pragma HLS INTERFACE s_axilite port=dW bundle=control
+#pragma HLS INTERFACE s_axilite port=dE bundle=control
+#pragma HLS INTERFACE s_axilite port=coeff bundle=control
 #pragma HLS INTERFACE s_axilite port=output bundle=control
+#pragma HLS INTERFACE s_axilite port=lambda_value bundle=control
+#pragma HLS INTERFACE s_axilite port=block_count bundle=control
+#pragma HLS INTERFACE axis port=out_update
+#pragma HLS INTERFACE axis port=out_meta
+#pragma HLS INTERFACE axis port=in_i_next
 #pragma HLS INTERFACE s_axilite port=return bundle=control
 
-    for (int tr = 0; tr < srad_cfg::kTileRows; ++tr) {
-        for (int tc = 0; tc < srad_cfg::kTileCols; ++tc) {
-            const int row0 = tr * srad_cfg::kBlockRows;
-            const int col0 = tc * srad_cfg::kBlockCols;
-            store_plain_tile(in_j_next, output, row0, col0);
+    const int blocks = active_blocks(block_count);
+    for (int block = 0; block < blocks; ++block) {
+        const int base = block * srad_cfg::kCudaBlockElems;
+
+        for (int plane = 0; plane < srad_cfg::kUpdateInputPlanes; ++plane) {
+            for (int word = 0; word < srad_cfg::kCudaBlockElems / 2; ++word) {
+#pragma HLS PIPELINE II=1
+                const int idx0 = base + (2 * word);
+                const int idx1 = idx0 + 1;
+                float lane0 = 0.0f;
+                float lane1 = 0.0f;
+                if (plane == 0) {
+                    lane0 = image_value_or_zero(image, idx0);
+                    lane1 = image_value_or_zero(image, idx1);
+                } else if (plane == 1) {
+                    lane0 = (idx0 < srad_cfg::kBoardPixels) ? dN[idx0] : 0.0f;
+                    lane1 = (idx1 < srad_cfg::kBoardPixels) ? dN[idx1] : 0.0f;
+                } else if (plane == 2) {
+                    lane0 = (idx0 < srad_cfg::kBoardPixels) ? dS[idx0] : 0.0f;
+                    lane1 = (idx1 < srad_cfg::kBoardPixels) ? dS[idx1] : 0.0f;
+                } else if (plane == 3) {
+                    lane0 = (idx0 < srad_cfg::kBoardPixels) ? dW[idx0] : 0.0f;
+                    lane1 = (idx1 < srad_cfg::kBoardPixels) ? dW[idx1] : 0.0f;
+                } else if (plane == 4) {
+                    lane0 = (idx0 < srad_cfg::kBoardPixels) ? dE[idx0] : 0.0f;
+                    lane1 = (idx1 < srad_cfg::kBoardPixels) ? dE[idx1] : 0.0f;
+                } else if (plane == 5) {
+                    lane0 = (idx0 < srad_cfg::kBoardPixels) ? coeff[idx0] : 0.0f;
+                    lane1 = (idx1 < srad_cfg::kBoardPixels) ? coeff[idx1] : 0.0f;
+                } else if (plane == 6) {
+                    lane0 = coeff_neighbor_or_zero(coeff, idx0, 1, 0);
+                    lane1 = coeff_neighbor_or_zero(coeff, idx1, 1, 0);
+                } else {
+                    lane0 = coeff_neighbor_or_zero(coeff, idx0, 0, 1);
+                    lane1 = coeff_neighbor_or_zero(coeff, idx1, 0, 1);
+                }
+                out_update.write(pack_two_floats(lane0, lane1));
+            }
+        }
+        write_meta_packet(lambda_value, out_meta);
+
+        for (int word = 0; word < srad_cfg::kCudaBlockElems / 2; ++word) {
+#pragma HLS PIPELINE II=1
+            const plio_word_t next_word = in_i_next.read();
+            const int idx0 = base + (2 * word);
+            const int idx1 = idx0 + 1;
+            if (idx0 < srad_cfg::kBoardPixels) {
+                output[idx0] = unpack_lane0(next_word);
+            }
+            if (idx1 < srad_cfg::kBoardPixels) {
+                output[idx1] = unpack_lane1(next_word);
+            }
         }
     }
 }

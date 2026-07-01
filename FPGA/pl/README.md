@@ -1,5 +1,7 @@
-This FPGA-v5-style AIE baseline does not use a PL kernel.
+This directory contains the PL transport shims for the existing
+`srad_fpga_v5` AIE kernel.
 
-q0sqr is computed inside `aie/srad_fpga.cc` Phase 1, then reused by the fused
-Phase 2. The `pl/` directory is present only to keep the project layout aligned
-with the existing SRAD baselines.
+`LoadFpgaV5` streams the input image in the exact order expected by the AIE
+kernel: first the full image for q0sqr reduction, then each halo tile for the
+update pass. `StoreFpgaV5` receives `(index,value)` pairs from AIE and writes
+valid updates back to DDR.

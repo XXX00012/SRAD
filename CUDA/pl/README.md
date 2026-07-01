@@ -1,10 +1,11 @@
-# PLIO movers
+This directory contains the PL bridge code for the current CUDA-style SRAD AIE
+mapping.
 
-This OpenCL-v0-faithful baseline uses PL HLS movers for DDR <-> PLIO
-transport. Global arrays use the OpenCL linear layout `row + Nr * col`.
+`TopPL.cpp` intentionally defines four HLS kernels from one source file:
 
-The AIE pipeline follows the OpenCL v0 stage boundaries: `prepare_kernel`
-materializes `d_sums` and `d_sums2`, `reduce_kernel` preserves the v0
-256-thread reduction tree, the host computes `q0sqr`, and the coefficient and
-update stages run as the v0 `srad_kernel` and `srad2_kernel` equivalents. PL
-movers only stream, tile, halo-pack, and store the global arrays.
+- `PreparePL`: DDR image block -> `gpu_prepare`, and writes sums/sums2 to DDR.
+- `ReducePL`: DDR sums/sums2 -> `gpu_reduce`, and writes per-block partials.
+- `CoeffPL`: DDR image + q0 -> `gpu_srad`, and writes dN/dS/dW/dE/c planes.
+- `UpdatePL`: DDR image + planes -> `gpu_srad2`, and writes next image.
+
+`Q0Ctrl.cpp` is legacy row-stream code and is not built by the active Makefile.

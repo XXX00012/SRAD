@@ -16,8 +16,8 @@ using srad_data_t = float;
 #define TILE_SIZE srad_cfg::kPixels
 
 #define NBYTES srad_cfg::kScalarBytes
-#define INPUT_FILE "./data/input_32x32.txt"
-#define OUTPUT_FILE "./data/TestOutputS.txt"
+#define INPUT_FILE "./data/input_4000x4000.txt"
+#define OUTPUT_FILE "./data/plio_fpga_j_next_value.txt"
 
 namespace srad_math {
 

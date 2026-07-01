@@ -1,9 +1,0 @@
-graph_id: ours_plq0
-rows: 64
-cols: 64
-toppl_workers: 4
-worker_lanes: 4
-parallel_lanes: 16
-aie_rows: 8
-aie_cols: 4
-kernels_per_lane: 2
