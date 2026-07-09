@@ -112,6 +112,8 @@ xrt::kernel open_kernel_cu(const xrt::device& device,
 }
 
 constexpr int kDiagPollMs = 1000;
+constexpr int kTopPlDebugSlots = 16;
+constexpr int kTopPlDebugBytes = 4096;
 constexpr const char* kBuildTag = "ours_192lane-12toppl-pktmerge-q0ctrl-20260626";
 
 void log_stage(const char* stage) {
@@ -122,6 +124,22 @@ void log_stage(const char* stage) {
 
 void log_value(const char* name, const std::string& value) {
     std::fprintf(stderr, "[diag] %s: %s\n", name, value.c_str());
+    std::fflush(stderr);
+    std::fflush(stdout);
+}
+
+void log_toppl_debug(const char* label, const float* debug, int worker) {
+    const float* base = debug + worker * kTopPlDebugSlots;
+    std::fprintf(stderr,
+                 "[diag] toppl_debug %s w%d:"
+                 " d0=%.0f d1=%.0f d2=%.0f d3=%.0f"
+                 " d4=%.0f d5=%.0f d6=%.0f d7=%.0f"
+                 " g0=%.0f g1=%.0f g2=%.0f g3=%.0f\n",
+                 label,
+                 worker,
+                 base[0], base[1], base[2], base[3],
+                 base[4], base[5], base[6], base[7],
+                 base[8], base[9], base[10], base[11]);
     std::fflush(stderr);
     std::fflush(stdout);
 }
@@ -253,17 +271,21 @@ int main(int argc, char* argv[]) {
             xrt::bo(device, srad_cfg::kBoardImageBytes, toppl[0].group_id(0));
         auto output_bo =
             xrt::bo(device, srad_cfg::kBoardOutputBytes, toppl[0].group_id(1));
+        auto toppl_debug_bo =
+            xrt::bo(device, kTopPlDebugBytes, toppl[0].group_id(2));
         auto debug_bo = xrt::bo(device, 4096, q0ctrl.group_id(0));
         log_stage("after allocate image/output/debug bos");
 
         log_stage("before map image/output/debug bos");
         auto image_map = image_bo.map<float*>();
         auto output_map = output_bo.map<float*>();
+        auto toppl_debug_map = toppl_debug_bo.map<float*>();
         auto debug_map = debug_bo.map<float*>();
         log_stage("after map image/output/debug bos");
 
         log_stage("before copy input to image map");
         std::memcpy(image_map, input.data(), srad_cfg::kBoardImageBytes);
+        std::memset(toppl_debug_map, 0, kTopPlDebugBytes);
         std::memset(debug_map, 0, 4096);
         log_stage("after copy input to image map");
 
@@ -274,6 +296,7 @@ int main(int argc, char* argv[]) {
         image_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         log_stage("after image bo sync TO_DEVICE");
         timing.bo_to_device_us = elapsed_us(stage_t0, Clock::now());
+        toppl_debug_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         debug_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         const auto pl_t0 = Clock::now();
@@ -302,7 +325,7 @@ int main(int argc, char* argv[]) {
         toppl_runs.reserve(srad_cfg::kTopPlWorkers);
         for (int worker = 0; worker < srad_cfg::kTopPlWorkers; ++worker) {
             toppl_runs.push_back(
-                toppl[worker](image_bo, output_bo, active_iters, worker));
+                toppl[worker](image_bo, output_bo, toppl_debug_bo, active_iters, worker));
         }
         log_stage("after toppl launch");
         timing.toppl_launch_us = elapsed_us(stage_t0, Clock::now());
@@ -313,12 +336,42 @@ int main(int argc, char* argv[]) {
 
         stage_t0 = Clock::now();
         log_stage("before toppl runs wait");
-        for (int worker = 0; worker < srad_cfg::kTopPlWorkers; ++worker) {
-            std::fprintf(stderr, "[diag] before TopPL_%d wait\n", worker);
-            std::fflush(stderr);
-            toppl_runs[worker].wait();
-            std::fprintf(stderr, "[diag] after TopPL_%d wait\n", worker);
-            std::fflush(stderr);
+        std::atomic<bool> toppl_poll_done{false};
+        std::thread toppl_poll_thread([&]() {
+            int poll = 0;
+            while (!toppl_poll_done.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(kDiagPollMs));
+                try {
+                    toppl_debug_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                    char label[32];
+                    std::snprintf(label, sizeof(label), "poll_%d", poll++);
+                    log_toppl_debug(label, toppl_debug_map, 0);
+                } catch (...) {
+                    std::fprintf(stderr, "[diag] toppl_debug poll sync failed\n");
+                    std::fflush(stderr);
+                }
+            }
+        });
+        try {
+            for (int worker = 0; worker < srad_cfg::kTopPlWorkers; ++worker) {
+                std::fprintf(stderr, "[diag] before TopPL_%d wait\n", worker);
+                std::fflush(stderr);
+                toppl_runs[worker].wait();
+                toppl_debug_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                log_toppl_debug("after_wait", toppl_debug_map, worker);
+                std::fprintf(stderr, "[diag] after TopPL_%d wait\n", worker);
+                std::fflush(stderr);
+            }
+            toppl_poll_done.store(true);
+            if (toppl_poll_thread.joinable()) {
+                toppl_poll_thread.join();
+            }
+        } catch (...) {
+            toppl_poll_done.store(true);
+            if (toppl_poll_thread.joinable()) {
+                toppl_poll_thread.join();
+            }
+            throw;
         }
         log_stage("after toppl runs wait");
         timing.toppl_wait_us = elapsed_us(stage_t0, Clock::now());

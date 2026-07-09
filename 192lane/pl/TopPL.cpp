@@ -1,4 +1,5 @@
 #include "../aie/Config.h"
+#include "../packet_ids_c.h"
 
 #include <ap_int.h>
 #include <hls_stream.h>
@@ -7,6 +8,10 @@
 namespace {
 
 using plio_word_t = ap_uint<64>;
+using packet_word_t = ap_uint<32>;
+
+constexpr int kTopPlDebugSlots = 16;
+constexpr int kTopPlDebugBase = 0;
 
 static_assert(srad_cfg::kTopPlWorkers == 12,
               "ours_192lane board path expects twelve TopPL CUs");
@@ -184,26 +189,128 @@ void forward_input_words(hls::stream<plio_word_t>& to_aie_words,
     }
 }
 
-int packet_merge_way(plio_word_t header) {
+void write_toppl_debug(float* debug, int worker_id, int slot, float value) {
 #pragma HLS INLINE
-    // The AIE compiler assigns pktmerge packet IDs. This default assumes the
-    // low ID bits map to the four merge inputs; confirm with packet_ids_c.h.
-    return static_cast<int>(header.range(1, 0));
+    debug[kTopPlDebugBase + worker_id * kTopPlDebugSlots + slot] = value;
+}
+
+packet_word_t read_packet_word32(hls::stream<plio_word_t>& in_j_next,
+                                 plio_word_t& cached_word,
+                                 bool& use_cached_high) {
+#pragma HLS INLINE
+    packet_word_t word = 0;
+    if (use_cached_high) {
+        word = cached_word.range(63, 32);
+        use_cached_high = false;
+    } else {
+        cached_word = in_j_next.read();
+        word = cached_word.range(31, 0);
+        use_cached_high = true;
+    }
+    return word;
+}
+
+int packet_id_from_header(packet_word_t header) {
+#pragma HLS INLINE
+    return static_cast<int>(header.range(4, 0));
+}
+
+int packet_merge_way(int global_merge_id, int packet_id) {
+#pragma HLS INLINE
+    static const int kPacketIds[srad_cfg::kMergedOutputPlioCount]
+                               [srad_cfg::kOutputMergeWays] = {
+    {ours_plq0_out_j_next_merged_0_0, ours_plq0_out_j_next_merged_0_1, ours_plq0_out_j_next_merged_0_2, ours_plq0_out_j_next_merged_0_3},
+    {ours_plq0_out_j_next_merged_1_0, ours_plq0_out_j_next_merged_1_1, ours_plq0_out_j_next_merged_1_2, ours_plq0_out_j_next_merged_1_3},
+    {ours_plq0_out_j_next_merged_2_0, ours_plq0_out_j_next_merged_2_1, ours_plq0_out_j_next_merged_2_2, ours_plq0_out_j_next_merged_2_3},
+    {ours_plq0_out_j_next_merged_3_0, ours_plq0_out_j_next_merged_3_1, ours_plq0_out_j_next_merged_3_2, ours_plq0_out_j_next_merged_3_3},
+    {ours_plq0_out_j_next_merged_4_0, ours_plq0_out_j_next_merged_4_1, ours_plq0_out_j_next_merged_4_2, ours_plq0_out_j_next_merged_4_3},
+    {ours_plq0_out_j_next_merged_5_0, ours_plq0_out_j_next_merged_5_1, ours_plq0_out_j_next_merged_5_2, ours_plq0_out_j_next_merged_5_3},
+    {ours_plq0_out_j_next_merged_6_0, ours_plq0_out_j_next_merged_6_1, ours_plq0_out_j_next_merged_6_2, ours_plq0_out_j_next_merged_6_3},
+    {ours_plq0_out_j_next_merged_7_0, ours_plq0_out_j_next_merged_7_1, ours_plq0_out_j_next_merged_7_2, ours_plq0_out_j_next_merged_7_3},
+    {ours_plq0_out_j_next_merged_8_0, ours_plq0_out_j_next_merged_8_1, ours_plq0_out_j_next_merged_8_2, ours_plq0_out_j_next_merged_8_3},
+    {ours_plq0_out_j_next_merged_9_0, ours_plq0_out_j_next_merged_9_1, ours_plq0_out_j_next_merged_9_2, ours_plq0_out_j_next_merged_9_3},
+    {ours_plq0_out_j_next_merged_10_0, ours_plq0_out_j_next_merged_10_1, ours_plq0_out_j_next_merged_10_2, ours_plq0_out_j_next_merged_10_3},
+    {ours_plq0_out_j_next_merged_11_0, ours_plq0_out_j_next_merged_11_1, ours_plq0_out_j_next_merged_11_2, ours_plq0_out_j_next_merged_11_3},
+    {ours_plq0_out_j_next_merged_12_0, ours_plq0_out_j_next_merged_12_1, ours_plq0_out_j_next_merged_12_2, ours_plq0_out_j_next_merged_12_3},
+    {ours_plq0_out_j_next_merged_13_0, ours_plq0_out_j_next_merged_13_1, ours_plq0_out_j_next_merged_13_2, ours_plq0_out_j_next_merged_13_3},
+    {ours_plq0_out_j_next_merged_14_0, ours_plq0_out_j_next_merged_14_1, ours_plq0_out_j_next_merged_14_2, ours_plq0_out_j_next_merged_14_3},
+    {ours_plq0_out_j_next_merged_15_0, ours_plq0_out_j_next_merged_15_1, ours_plq0_out_j_next_merged_15_2, ours_plq0_out_j_next_merged_15_3},
+    {ours_plq0_out_j_next_merged_16_0, ours_plq0_out_j_next_merged_16_1, ours_plq0_out_j_next_merged_16_2, ours_plq0_out_j_next_merged_16_3},
+    {ours_plq0_out_j_next_merged_17_0, ours_plq0_out_j_next_merged_17_1, ours_plq0_out_j_next_merged_17_2, ours_plq0_out_j_next_merged_17_3},
+    {ours_plq0_out_j_next_merged_18_0, ours_plq0_out_j_next_merged_18_1, ours_plq0_out_j_next_merged_18_2, ours_plq0_out_j_next_merged_18_3},
+    {ours_plq0_out_j_next_merged_19_0, ours_plq0_out_j_next_merged_19_1, ours_plq0_out_j_next_merged_19_2, ours_plq0_out_j_next_merged_19_3},
+    {ours_plq0_out_j_next_merged_20_0, ours_plq0_out_j_next_merged_20_1, ours_plq0_out_j_next_merged_20_2, ours_plq0_out_j_next_merged_20_3},
+    {ours_plq0_out_j_next_merged_21_0, ours_plq0_out_j_next_merged_21_1, ours_plq0_out_j_next_merged_21_2, ours_plq0_out_j_next_merged_21_3},
+    {ours_plq0_out_j_next_merged_22_0, ours_plq0_out_j_next_merged_22_1, ours_plq0_out_j_next_merged_22_2, ours_plq0_out_j_next_merged_22_3},
+    {ours_plq0_out_j_next_merged_23_0, ours_plq0_out_j_next_merged_23_1, ours_plq0_out_j_next_merged_23_2, ours_plq0_out_j_next_merged_23_3},
+    {ours_plq0_out_j_next_merged_24_0, ours_plq0_out_j_next_merged_24_1, ours_plq0_out_j_next_merged_24_2, ours_plq0_out_j_next_merged_24_3},
+    {ours_plq0_out_j_next_merged_25_0, ours_plq0_out_j_next_merged_25_1, ours_plq0_out_j_next_merged_25_2, ours_plq0_out_j_next_merged_25_3},
+    {ours_plq0_out_j_next_merged_26_0, ours_plq0_out_j_next_merged_26_1, ours_plq0_out_j_next_merged_26_2, ours_plq0_out_j_next_merged_26_3},
+    {ours_plq0_out_j_next_merged_27_0, ours_plq0_out_j_next_merged_27_1, ours_plq0_out_j_next_merged_27_2, ours_plq0_out_j_next_merged_27_3},
+    {ours_plq0_out_j_next_merged_28_0, ours_plq0_out_j_next_merged_28_1, ours_plq0_out_j_next_merged_28_2, ours_plq0_out_j_next_merged_28_3},
+    {ours_plq0_out_j_next_merged_29_0, ours_plq0_out_j_next_merged_29_1, ours_plq0_out_j_next_merged_29_2, ours_plq0_out_j_next_merged_29_3},
+    {ours_plq0_out_j_next_merged_30_0, ours_plq0_out_j_next_merged_30_1, ours_plq0_out_j_next_merged_30_2, ours_plq0_out_j_next_merged_30_3},
+    {ours_plq0_out_j_next_merged_31_0, ours_plq0_out_j_next_merged_31_1, ours_plq0_out_j_next_merged_31_2, ours_plq0_out_j_next_merged_31_3},
+    {ours_plq0_out_j_next_merged_32_0, ours_plq0_out_j_next_merged_32_1, ours_plq0_out_j_next_merged_32_2, ours_plq0_out_j_next_merged_32_3},
+    {ours_plq0_out_j_next_merged_33_0, ours_plq0_out_j_next_merged_33_1, ours_plq0_out_j_next_merged_33_2, ours_plq0_out_j_next_merged_33_3},
+    {ours_plq0_out_j_next_merged_34_0, ours_plq0_out_j_next_merged_34_1, ours_plq0_out_j_next_merged_34_2, ours_plq0_out_j_next_merged_34_3},
+    {ours_plq0_out_j_next_merged_35_0, ours_plq0_out_j_next_merged_35_1, ours_plq0_out_j_next_merged_35_2, ours_plq0_out_j_next_merged_35_3},
+    {ours_plq0_out_j_next_merged_36_0, ours_plq0_out_j_next_merged_36_1, ours_plq0_out_j_next_merged_36_2, ours_plq0_out_j_next_merged_36_3},
+    {ours_plq0_out_j_next_merged_37_0, ours_plq0_out_j_next_merged_37_1, ours_plq0_out_j_next_merged_37_2, ours_plq0_out_j_next_merged_37_3},
+    {ours_plq0_out_j_next_merged_38_0, ours_plq0_out_j_next_merged_38_1, ours_plq0_out_j_next_merged_38_2, ours_plq0_out_j_next_merged_38_3},
+    {ours_plq0_out_j_next_merged_39_0, ours_plq0_out_j_next_merged_39_1, ours_plq0_out_j_next_merged_39_2, ours_plq0_out_j_next_merged_39_3},
+    {ours_plq0_out_j_next_merged_40_0, ours_plq0_out_j_next_merged_40_1, ours_plq0_out_j_next_merged_40_2, ours_plq0_out_j_next_merged_40_3},
+    {ours_plq0_out_j_next_merged_41_0, ours_plq0_out_j_next_merged_41_1, ours_plq0_out_j_next_merged_41_2, ours_plq0_out_j_next_merged_41_3},
+    {ours_plq0_out_j_next_merged_42_0, ours_plq0_out_j_next_merged_42_1, ours_plq0_out_j_next_merged_42_2, ours_plq0_out_j_next_merged_42_3},
+    {ours_plq0_out_j_next_merged_43_0, ours_plq0_out_j_next_merged_43_1, ours_plq0_out_j_next_merged_43_2, ours_plq0_out_j_next_merged_43_3},
+    {ours_plq0_out_j_next_merged_44_0, ours_plq0_out_j_next_merged_44_1, ours_plq0_out_j_next_merged_44_2, ours_plq0_out_j_next_merged_44_3},
+    {ours_plq0_out_j_next_merged_45_0, ours_plq0_out_j_next_merged_45_1, ours_plq0_out_j_next_merged_45_2, ours_plq0_out_j_next_merged_45_3},
+    {ours_plq0_out_j_next_merged_46_0, ours_plq0_out_j_next_merged_46_1, ours_plq0_out_j_next_merged_46_2, ours_plq0_out_j_next_merged_46_3},
+    {ours_plq0_out_j_next_merged_47_0, ours_plq0_out_j_next_merged_47_1, ours_plq0_out_j_next_merged_47_2, ours_plq0_out_j_next_merged_47_3}
+    };
+
+    int merge = global_merge_id;
+    if (merge < 0) {
+        merge = 0;
+    }
+    if (merge >= srad_cfg::kMergedOutputPlioCount) {
+        merge = srad_cfg::kMergedOutputPlioCount - 1;
+    }
+
+    if (packet_id == kPacketIds[merge][0]) {
+        return 0;
+    }
+    if (packet_id == kPacketIds[merge][1]) {
+        return 1;
+    }
+    if (packet_id == kPacketIds[merge][2]) {
+        return 2;
+    }
+    return 3;
 }
 
 template<int Way>
 void capture_merged_payload_words(hls::stream<plio_word_t>& in_j_next,
-                                  hls::stream<plio_word_t>& from_aie_words) {
+                                  hls::stream<plio_word_t>& from_aie_words,
+                                  plio_word_t& cached_word,
+                                  bool& use_cached_high) {
 #pragma HLS INLINE off
     for (int word = 0; word < kWordsPerRow; ++word) {
 #pragma HLS PIPELINE II=1
-        const plio_word_t payload0 = in_j_next.read();
-        const plio_word_t payload1 = in_j_next.read();
+        const packet_word_t payload0 =
+            read_packet_word32(in_j_next, cached_word, use_cached_high);
+        const packet_word_t payload1 =
+            read_packet_word32(in_j_next, cached_word, use_cached_high);
         plio_word_t payload = 0;
-        payload.range(31, 0) = payload0.range(31, 0);
-        payload.range(63, 32) = payload1.range(31, 0);
+        payload.range(31, 0) = payload0;
+        payload.range(63, 32) = payload1;
         from_aie_words.write(payload);
     }
+
+    // Each AIE packet contains 1 header + 128 payload 32-bit words: an odd
+    // number of packet words. With 64-bit PLIO the final high half is padding,
+    // so do not treat the cached high half as the next packet header.
+    use_cached_high = false;
 }
 
 // Group selects which contiguous 4-lane slice of from_aie_words this merged
@@ -212,20 +319,30 @@ void capture_merged_payload_words(hls::stream<plio_word_t>& in_j_next,
 // which group, not which of the 4 ways within it.
 template<int Group>
 void capture_merged_output_packets(hls::stream<plio_word_t>& in_j_next,
-                                   hls::stream<plio_word_t> from_aie_words[kLanesPerWorker]) {
+                                   hls::stream<plio_word_t> from_aie_words[kLanesPerWorker],
+                                   int worker_id) {
 #pragma HLS INLINE off
+    const int global_merge_id = worker_id * srad_cfg::kMergedOutputsPerTopPl + Group;
     for (int stream_row = 0; stream_row < kStreamRowsPerLane; ++stream_row) {
         for (int packet = 0; packet < srad_cfg::kOutputMergeWays; ++packet) {
-            const plio_word_t header = in_j_next.read();
-            const int way = packet_merge_way(header);
+            plio_word_t cached_word = 0;
+            bool use_cached_high = false;
+            const packet_word_t header =
+                read_packet_word32(in_j_next, cached_word, use_cached_high);
+            const int packet_id = packet_id_from_header(header);
+            const int way = packet_merge_way(global_merge_id, packet_id);
             if (way == 0) {
-                capture_merged_payload_words<0>(in_j_next, from_aie_words[4 * Group + 0]);
+                capture_merged_payload_words<0>(in_j_next, from_aie_words[4 * Group + 0],
+                                                cached_word, use_cached_high);
             } else if (way == 1) {
-                capture_merged_payload_words<1>(in_j_next, from_aie_words[4 * Group + 1]);
+                capture_merged_payload_words<1>(in_j_next, from_aie_words[4 * Group + 1],
+                                                cached_word, use_cached_high);
             } else if (way == 2) {
-                capture_merged_payload_words<2>(in_j_next, from_aie_words[4 * Group + 2]);
+                capture_merged_payload_words<2>(in_j_next, from_aie_words[4 * Group + 2],
+                                                cached_word, use_cached_high);
             } else {
-                capture_merged_payload_words<3>(in_j_next, from_aie_words[4 * Group + 3]);
+                capture_merged_payload_words<3>(in_j_next, from_aie_words[4 * Group + 3],
+                                                cached_word, use_cached_high);
             }
         }
     }
@@ -487,10 +604,10 @@ void run_one_strip_batch_16lanes(
 #pragma HLS UNROLL
         forward_input_words(to_aie_words[lane], out_j[lane]);
     }
-    capture_merged_output_packets<0>(in_j_next[0], from_aie_words);
-    capture_merged_output_packets<1>(in_j_next[1], from_aie_words);
-    capture_merged_output_packets<2>(in_j_next[2], from_aie_words);
-    capture_merged_output_packets<3>(in_j_next[3], from_aie_words);
+    capture_merged_output_packets<0>(in_j_next[0], from_aie_words, worker_id);
+    capture_merged_output_packets<1>(in_j_next[1], from_aie_words, worker_id);
+    capture_merged_output_packets<2>(in_j_next[2], from_aie_words, worker_id);
+    capture_merged_output_packets<3>(in_j_next[3], from_aie_words, worker_id);
     store_16lane_output_rows(next, worker_id, from_aie_words, lane_stat);
     collect_16lane_stats(lane_stat, lane_sum, lane_sum2);
 }
@@ -552,6 +669,7 @@ extern "C" {
 
 void TopPL(float* image,
            float* output,
+           float* debug,
            int iter_cnt,
            int worker_id,
            hls::stream<plio_word_t> out_j[srad_cfg::kLanesPerTopPl],
@@ -566,6 +684,7 @@ void TopPL(float* image,
     max_read_burst_length=16 max_write_burst_length=16 \
     num_read_outstanding=1 num_write_outstanding=1 \
     max_widen_bitwidth=128
+#pragma HLS INTERFACE m_axi port=debug offset=slave bundle=gmem2
 #pragma HLS INTERFACE axis port=out_j
 #pragma HLS INTERFACE axis port=in_j_next
 #pragma HLS INTERFACE axis port=stat_to_q0
@@ -574,6 +693,7 @@ void TopPL(float* image,
 #pragma HLS ARRAY_PARTITION variable=in_j_next complete dim=1
 #pragma HLS INTERFACE s_axilite port=image bundle=control
 #pragma HLS INTERFACE s_axilite port=output bundle=control
+#pragma HLS INTERFACE s_axilite port=debug bundle=control
 #pragma HLS INTERFACE s_axilite port=iter_cnt bundle=control
 #pragma HLS INTERFACE s_axilite port=worker_id bundle=control
 #pragma HLS INTERFACE s_axilite port=return bundle=control
@@ -581,16 +701,21 @@ void TopPL(float* image,
 
     const int active_iters = active_iterations(iter_cnt);
     const int active_worker = clamp_worker_id(worker_id);
+    write_toppl_debug(debug, active_worker, 0, 1000.0f + static_cast<float>(active_worker));
+    write_toppl_debug(debug, active_worker, 1, static_cast<float>(active_iters));
 
     float sum = 0.0f;
     float sum2 = 0.0f;
     compute_initial_worker_stats(image, active_worker, sum, sum2);
+    write_toppl_debug(debug, active_worker, 2, 1010.0f);
     stat_to_q0.write(pack_two_floats(sum, sum2));
+    write_toppl_debug(debug, active_worker, 3, 1020.0f);
 
     for (int iter = 0; iter < srad_cfg::kBoardIterations; ++iter) {
         if (iter < active_iters) {
             const plio_word_t q0_word = q0_from_ctrl.read();
             const float q0sqr = unpack_lane0(q0_word);
+            write_toppl_debug(debug, active_worker, 4, 1030.0f + static_cast<float>(iter));
             float next_sum = 0.0f;
             float next_sum2 = 0.0f;
 
@@ -613,15 +738,18 @@ void TopPL(float* image,
                                  next_sum,
                                  next_sum2);
             }
+            write_toppl_debug(debug, active_worker, 5, 1040.0f + static_cast<float>(iter));
             sum = next_sum;
             sum2 = next_sum2;
             stat_to_q0.write(pack_two_floats(sum, sum2));
+            write_toppl_debug(debug, active_worker, 6, 1050.0f + static_cast<float>(iter));
         }
     }
 
     if ((active_iters & 1) == 0) {
         copy_final_worker_region_to_output(image, output, active_worker);
     }
+    write_toppl_debug(debug, active_worker, 7, 2000.0f + static_cast<float>(active_worker));
 }
 
 }

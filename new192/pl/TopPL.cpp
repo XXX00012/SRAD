@@ -184,25 +184,38 @@ void forward_input_words(hls::stream<plio_word_t>& to_aie_words,
     }
 }
 
-int packet_merge_way(plio_word_t header) {
+int packet_merge_way(plio_word_t header_beat) {
 #pragma HLS INLINE
-    // The AIE compiler assigns pktmerge packet IDs. This default assumes the
-    // low ID bits map to the four merge inputs; confirm with packet_ids_c.h.
-    return static_cast<int>(header.range(1, 0));
+    // Packet ID lives in bits [4:0] of the 32-bit packet header.  The current
+    // generated packet_ids_c.h maps every 4-way pktmerge input to IDs 0..3, so
+    // the low two bits identify the merge way.  If future generated IDs are no
+    // longer 0..3, replace this with an explicit ID-to-way table.
+    return static_cast<int>(header_beat.range(1, 0));
 }
 
 template<int Way>
 void capture_merged_payload_words(hls::stream<plio_word_t>& in_j_next,
-                                  hls::stream<plio_word_t>& from_aie_words) {
+                                  hls::stream<plio_word_t>& from_aie_words,
+                                  plio_word_t header_beat) {
 #pragma HLS INLINE off
+    // AIE output_pktstream writes a 32-bit packet header followed by 128
+    // 32-bit payload words.  The graph exposes this as plio_64_bits, so the
+    // 32-bit packet-stream words are packed two per 64-bit PL beat:
+    //   header_beat[31:0]  = packet header
+    //   header_beat[63:32] = payload[0]
+    // The header consumes the first low32 slot, so payload pairs cross beat
+    // boundaries.  Consume one header beat plus kWordsPerRow following beats:
+    // ceil((1 header + 128 payload words) / 2) = 65 beats per packet.
+    ap_uint<32> carry = header_beat.range(63, 32);
+
     for (int word = 0; word < kWordsPerRow; ++word) {
 #pragma HLS PIPELINE II=1
-        const plio_word_t payload0 = in_j_next.read();
-        const plio_word_t payload1 = in_j_next.read();
+        const plio_word_t beat = in_j_next.read();
         plio_word_t payload = 0;
-        payload.range(31, 0) = payload0.range(31, 0);
-        payload.range(63, 32) = payload1.range(31, 0);
+        payload.range(31, 0) = carry;
+        payload.range(63, 32) = beat.range(31, 0);
         from_aie_words.write(payload);
+        carry = beat.range(63, 32);
     }
 }
 
@@ -219,13 +232,17 @@ void capture_merged_output_packets(hls::stream<plio_word_t>& in_j_next,
             const plio_word_t header = in_j_next.read();
             const int way = packet_merge_way(header);
             if (way == 0) {
-                capture_merged_payload_words<0>(in_j_next, from_aie_words[4 * Group + 0]);
+                capture_merged_payload_words<0>(
+                    in_j_next, from_aie_words[4 * Group + 0], header);
             } else if (way == 1) {
-                capture_merged_payload_words<1>(in_j_next, from_aie_words[4 * Group + 1]);
+                capture_merged_payload_words<1>(
+                    in_j_next, from_aie_words[4 * Group + 1], header);
             } else if (way == 2) {
-                capture_merged_payload_words<2>(in_j_next, from_aie_words[4 * Group + 2]);
+                capture_merged_payload_words<2>(
+                    in_j_next, from_aie_words[4 * Group + 2], header);
             } else {
-                capture_merged_payload_words<3>(in_j_next, from_aie_words[4 * Group + 3]);
+                capture_merged_payload_words<3>(
+                    in_j_next, from_aie_words[4 * Group + 3], header);
             }
         }
     }

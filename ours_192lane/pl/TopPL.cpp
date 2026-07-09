@@ -578,10 +578,6 @@ struct Plio32Reader {
     bool has_high;
 };
 
-struct OutputWriteRecord {
-    int index;
-    float value;
-};
 
 void init_plio32_reader(Plio32Reader& reader) {
 #pragma HLS INLINE
@@ -622,7 +618,7 @@ void consume_one_output_packet(hls::stream<plio_word_t>& in_j_next,
                                Plio32Reader& reader,
                                int worker_id,
                                int row_count[srad_cfg::kOutputMergeWays],
-                               hls::stream<OutputWriteRecord>& write_records,
+                               float* next,
                                float group_sum[srad_cfg::kOutputMergeWays],
                                float group_sum2[srad_cfg::kOutputMergeWays]) {
 #pragma HLS INLINE off
@@ -659,10 +655,7 @@ void consume_one_output_packet(hls::stream<plio_word_t>& in_j_next,
 
         if (valid_output_row) {
             if (phys_col < srad_cfg::kRowDataElems) {
-                OutputWriteRecord rec;
-                rec.index = row_base + phys_col;
-                rec.value = value;
-                write_records.write(rec);
+                next[row_base + phys_col] = value;
             }
             if (phys_col == srad_cfg::kStatSumPadIndex) {
                 row_sum = value;
@@ -687,38 +680,103 @@ void consume_one_output_packet(hls::stream<plio_word_t>& in_j_next,
     }
 }
 
-template<int Group>
-void consume_merged_output_stream(hls::stream<plio_word_t>& in_j_next,
-                                  int worker_id,
-                                  hls::stream<OutputWriteRecord>& write_records,
-                                  float group_sum[srad_cfg::kOutputMergeWays],
-                                  float group_sum2[srad_cfg::kOutputMergeWays]) {
-#pragma HLS INLINE off
+void init_output_group_state(int row_count[srad_cfg::kOutputMergeWays],
+                             float group_sum[srad_cfg::kOutputMergeWays],
+                             float group_sum2[srad_cfg::kOutputMergeWays]) {
+#pragma HLS INLINE
+#pragma HLS ARRAY_PARTITION variable=row_count complete dim=1
 #pragma HLS ARRAY_PARTITION variable=group_sum complete dim=1
 #pragma HLS ARRAY_PARTITION variable=group_sum2 complete dim=1
-    int row_count[srad_cfg::kOutputMergeWays];
-#pragma HLS ARRAY_PARTITION variable=row_count complete dim=1
-    Plio32Reader reader;
-    init_plio32_reader(reader);
-
     for (int way = 0; way < srad_cfg::kOutputMergeWays; ++way) {
 #pragma HLS UNROLL
         row_count[way] = 0;
         group_sum[way] = 0.0f;
         group_sum2[way] = 0.0f;
     }
+}
 
+void consume_all_merged_output_streams(
+    hls::stream<plio_word_t> in_j_next[srad_cfg::kMergedOutputsPerTopPl],
+    int worker_id,
+    float* next,
+    float group_sum0[srad_cfg::kOutputMergeWays],
+    float group_sum1[srad_cfg::kOutputMergeWays],
+    float group_sum2_in[srad_cfg::kOutputMergeWays],
+    float group_sum3[srad_cfg::kOutputMergeWays],
+    float group_sum20[srad_cfg::kOutputMergeWays],
+    float group_sum21[srad_cfg::kOutputMergeWays],
+    float group_sum22[srad_cfg::kOutputMergeWays],
+    float group_sum23[srad_cfg::kOutputMergeWays]) {
+#pragma HLS INLINE off
+#pragma HLS ARRAY_PARTITION variable=in_j_next complete dim=1
+#pragma HLS ARRAY_PARTITION variable=group_sum0 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=group_sum1 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=group_sum2_in complete dim=1
+#pragma HLS ARRAY_PARTITION variable=group_sum3 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=group_sum20 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=group_sum21 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=group_sum22 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=group_sum23 complete dim=1
+
+    int row_count0[srad_cfg::kOutputMergeWays];
+    int row_count1[srad_cfg::kOutputMergeWays];
+    int row_count2[srad_cfg::kOutputMergeWays];
+    int row_count3[srad_cfg::kOutputMergeWays];
+#pragma HLS ARRAY_PARTITION variable=row_count0 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=row_count1 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=row_count2 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=row_count3 complete dim=1
+
+    Plio32Reader reader0;
+    Plio32Reader reader1;
+    Plio32Reader reader2;
+    Plio32Reader reader3;
+    init_plio32_reader(reader0);
+    init_plio32_reader(reader1);
+    init_plio32_reader(reader2);
+    init_plio32_reader(reader3);
+
+    init_output_group_state(row_count0, group_sum0, group_sum20);
+    init_output_group_state(row_count1, group_sum1, group_sum21);
+    init_output_group_state(row_count2, group_sum2_in, group_sum22);
+    init_output_group_state(row_count3, group_sum3, group_sum23);
+
+    // Keep one DATAFLOW process as the only DDR writer. This avoids the HLS
+    // multi-process m_axi write error without introducing deep BRAM/URAM FIFOs
+    // or a nonblocking arbitration network. Each merged stream is still consumed
+    // packet-by-packet and packet IDs are decoded from the header.
     constexpr int kPacketsPerMergedStream =
         kStreamRowsPerLane * srad_cfg::kOutputMergeWays;
     for (int packet = 0; packet < kPacketsPerMergedStream; ++packet) {
 #pragma HLS PIPELINE off
-        consume_one_output_packet<Group>(in_j_next,
-                                         reader,
-                                         worker_id,
-                                         row_count,
-                                         write_records,
-                                         group_sum,
-                                         group_sum2);
+        consume_one_output_packet<0>(in_j_next[0],
+                                     reader0,
+                                     worker_id,
+                                     row_count0,
+                                     next,
+                                     group_sum0,
+                                     group_sum20);
+        consume_one_output_packet<1>(in_j_next[1],
+                                     reader1,
+                                     worker_id,
+                                     row_count1,
+                                     next,
+                                     group_sum1,
+                                     group_sum21);
+        consume_one_output_packet<2>(in_j_next[2],
+                                     reader2,
+                                     worker_id,
+                                     row_count2,
+                                     next,
+                                     group_sum2_in,
+                                     group_sum22);
+        consume_one_output_packet<3>(in_j_next[3],
+                                     reader3,
+                                     worker_id,
+                                     row_count3,
+                                     next,
+                                     group_sum3,
+                                     group_sum23);
     }
 }
 
@@ -949,60 +1007,6 @@ void collect_16lane_stats(hls::stream<plio_word_t> lane_stat[kLanesPerWorker],
     }
 }
 
-int valid_output_rows_per_lane(int worker_id) {
-#pragma HLS INLINE off
-    int count = 0;
-    const int row_base_global = worker_row_base(worker_id);
-    for (int local_row = 0;
-         local_row < srad_cfg::kRowsPerRowBlock;
-         ++local_row) {
-#pragma HLS PIPELINE II=1
-        const int board_row = row_base_global + local_row;
-        if (real_board_row(board_row)) {
-            ++count;
-        }
-    }
-    return count;
-}
-
-void write_merged_output_records(float* next,
-                                 int worker_id,
-                                 hls::stream<OutputWriteRecord>& write_records0,
-                                 hls::stream<OutputWriteRecord>& write_records1,
-                                 hls::stream<OutputWriteRecord>& write_records2,
-                                 hls::stream<OutputWriteRecord>& write_records3) {
-#pragma HLS INLINE off
-    const int valid_rows = valid_output_rows_per_lane(worker_id);
-    const int records_per_group =
-        valid_rows * srad_cfg::kOutputMergeWays * srad_cfg::kRowDataElems;
-    const int total_records =
-        records_per_group * srad_cfg::kMergedOutputsPerTopPl;
-
-    int written = 0;
-    int preferred_group = 0;
-    while (written < total_records) {
-#pragma HLS PIPELINE II=1
-        OutputWriteRecord rec;
-        bool got = false;
-
-        if (preferred_group == 0) {
-            got = write_records0.read_nb(rec);
-        } else if (preferred_group == 1) {
-            got = write_records1.read_nb(rec);
-        } else if (preferred_group == 2) {
-            got = write_records2.read_nb(rec);
-        } else {
-            got = write_records3.read_nb(rec);
-        }
-
-        preferred_group = (preferred_group + 1) & 0x3;
-        if (got) {
-            next[rec.index] = rec.value;
-            ++written;
-        }
-    }
-}
-
 void merge_group_stats(float group_sum0[srad_cfg::kOutputMergeWays],
                        float group_sum1[srad_cfg::kOutputMergeWays],
                        float group_sum2_in[srad_cfg::kOutputMergeWays],
@@ -1055,19 +1059,6 @@ void run_one_strip_batch_16lanes(
 #pragma HLS STREAM variable=to_aie_words depth=16
 #pragma HLS bind_storage variable=to_aie_words type=fifo impl=srl
 
-    hls::stream<OutputWriteRecord> write_records0;
-    hls::stream<OutputWriteRecord> write_records1;
-    hls::stream<OutputWriteRecord> write_records2;
-    hls::stream<OutputWriteRecord> write_records3;
-#pragma HLS STREAM variable=write_records0 depth=512
-#pragma HLS STREAM variable=write_records1 depth=512
-#pragma HLS STREAM variable=write_records2 depth=512
-#pragma HLS STREAM variable=write_records3 depth=512
-#pragma HLS bind_storage variable=write_records0 type=fifo impl=bram
-#pragma HLS bind_storage variable=write_records1 type=fifo impl=bram
-#pragma HLS bind_storage variable=write_records2 type=fifo impl=bram
-#pragma HLS bind_storage variable=write_records3 type=fifo impl=bram
-
     float group_sum0[srad_cfg::kOutputMergeWays];
     float group_sum1[srad_cfg::kOutputMergeWays];
     float group_sum2_local[srad_cfg::kOutputMergeWays];
@@ -1091,20 +1082,17 @@ void run_one_strip_batch_16lanes(
 #pragma HLS UNROLL
         forward_input_words(to_aie_words[lane], out_j[lane]);
     }
-    consume_merged_output_stream<0>(in_j_next[0], worker_id, write_records0,
-                                    group_sum0, group_sum20);
-    consume_merged_output_stream<1>(in_j_next[1], worker_id, write_records1,
-                                    group_sum1, group_sum21);
-    consume_merged_output_stream<2>(in_j_next[2], worker_id, write_records2,
-                                    group_sum2_local, group_sum22);
-    consume_merged_output_stream<3>(in_j_next[3], worker_id, write_records3,
-                                    group_sum3, group_sum23);
-    write_merged_output_records(next,
-                                worker_id,
-                                write_records0,
-                                write_records1,
-                                write_records2,
-                                write_records3);
+    consume_all_merged_output_streams(in_j_next,
+                                      worker_id,
+                                      next,
+                                      group_sum0,
+                                      group_sum1,
+                                      group_sum2_local,
+                                      group_sum3,
+                                      group_sum20,
+                                      group_sum21,
+                                      group_sum22,
+                                      group_sum23);
     merge_group_stats(group_sum0,
                       group_sum1,
                       group_sum2_local,

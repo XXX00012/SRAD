@@ -139,81 +139,6 @@ void log_stage(const char* stage) {
     std::fflush(stdout);
 }
 
-void dump_q0_debug_values(const char* stage, const float* debug) {
-    std::fprintf(stderr,
-                 "[diag] q0_debug %s: d0=%.9g d1=%.9g d2=%.9g d3=%.9g "
-                 "d4=%.9g d5=%.9g d6=%.9g d7=%.9g\n",
-                 stage,
-                 debug[0],
-                 debug[1],
-                 debug[2],
-                 debug[3],
-                 debug[4],
-                 debug[5],
-                 debug[6],
-                 debug[7]);
-    std::fflush(stderr);
-}
-
-void sync_and_dump_q0_debug(xrt::bo& debug_bo,
-                            const float* debug_map,
-                            const char* stage) {
-    try {
-        debug_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        dump_q0_debug_values(stage, debug_map);
-    } catch (const std::exception& ex) {
-        std::fprintf(stderr,
-                     "[diag] q0_debug %s: sync failed: %s\n",
-                     stage,
-                     ex.what());
-        std::fflush(stderr);
-    }
-}
-
-class Q0DebugPoller {
-public:
-    Q0DebugPoller(xrt::bo& debug_bo, const float* debug_map)
-        : debug_bo_(debug_bo), debug_map_(debug_map) {}
-
-    Q0DebugPoller(const Q0DebugPoller&) = delete;
-    Q0DebugPoller& operator=(const Q0DebugPoller&) = delete;
-
-    ~Q0DebugPoller() { stop(); }
-
-    void start() {
-        if (thread_.joinable()) {
-            return;
-        }
-        stop_.store(false);
-        thread_ = std::thread([this]() {
-            int poll = 0;
-            while (!stop_.load()) {
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(kDiagPollMs));
-                if (stop_.load()) {
-                    break;
-                }
-                char stage[64];
-                std::snprintf(stage, sizeof(stage), "poll_%d", poll++);
-                sync_and_dump_q0_debug(debug_bo_, debug_map_, stage);
-            }
-        });
-    }
-
-    void stop() {
-        stop_.store(true);
-        if (thread_.joinable()) {
-            thread_.join();
-        }
-    }
-
-private:
-    xrt::bo& debug_bo_;
-    const float* debug_map_ = nullptr;
-    std::atomic<bool> stop_{false};
-    std::thread thread_;
-};
-
 void log_value(const char* name, const std::string& value) {
     std::fprintf(stderr, "[diag] %s: %s\n", name, value.c_str());
     std::fflush(stderr);
@@ -389,7 +314,6 @@ int main(int argc, char* argv[]) {
         log_stage("before q0ctrl launch");
         auto q0_run = q0ctrl(debug_bo, active_iters);
         log_stage("after q0ctrl launch");
-        sync_and_dump_q0_debug(debug_bo, debug_map, "after q0ctrl launch");
         timing.q0_launch_us = elapsed_us(stage_t0, Clock::now());
 
         stage_t0 = Clock::now();
@@ -401,9 +325,6 @@ int main(int argc, char* argv[]) {
                 toppl[worker](image_bo, output_bo, active_iters, worker));
         }
         log_stage("after toppl launch");
-        sync_and_dump_q0_debug(debug_bo, debug_map, "after toppl launch");
-        Q0DebugPoller q0_debug_poller(debug_bo, debug_map);
-        q0_debug_poller.start();
         timing.toppl_launch_us = elapsed_us(stage_t0, Clock::now());
         timing.submit_us = timing.graph_init_us +
                            timing.graph_run_submit_us +
@@ -413,22 +334,15 @@ int main(int argc, char* argv[]) {
         stage_t0 = Clock::now();
         log_stage("before toppl runs wait");
         for (int worker = 0; worker < srad_cfg::kTopPlWorkers; ++worker) {
-            std::fprintf(stderr, "[diag] before TopPL_%d wait\n", worker);
-            std::fflush(stderr);
             toppl_runs[worker].wait();
-            std::fprintf(stderr, "[diag] after TopPL_%d wait\n", worker);
-            std::fflush(stderr);
         }
         log_stage("after toppl runs wait");
-        sync_and_dump_q0_debug(debug_bo, debug_map, "after toppl runs wait");
         timing.toppl_wait_us = elapsed_us(stage_t0, Clock::now());
 
         stage_t0 = Clock::now();
         log_stage("before q0_run.wait");
         q0_run.wait();
         log_stage("after q0_run.wait");
-        sync_and_dump_q0_debug(debug_bo, debug_map, "after q0_run.wait");
-        q0_debug_poller.stop();
         timing.q0_wait_us = elapsed_us(stage_t0, Clock::now());
 
         stage_t0 = Clock::now();
